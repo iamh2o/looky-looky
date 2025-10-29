@@ -221,7 +221,9 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
             pass
         if stop_ev.is_set():
             raise sd.CallbackStop()
-        if rec.AcceptWaveform(indata.tobytes()):
+        # RawInputStream provides a cffi buffer without ``tobytes``; coerce explicitly
+        chunk = bytes(indata)
+        if rec.AcceptWaveform(chunk):
             txt = rec.Result()
         else:
             txt = rec.PartialResult()

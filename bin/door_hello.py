@@ -6,10 +6,15 @@ within TIME_WINDOW seconds. Offline: YOLOv8n for person, Vosk for ASR.
 macOS: grant Camera & Microphone permissions on first run.
 """
 
+from __future__ import annotations
+
+import json
 import time
 import queue
+import random
 import threading
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -19,6 +24,14 @@ from ultralytics import YOLO
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
+try:
+    import face_recognition
+except ImportError as exc:
+    raise ImportError(
+        "The 'face_recognition' package is required for identifying known visitors. "
+        "Install it with 'pip install face_recognition'."
+    ) from exc
+
 # ---------- Config ----------
 CAMERA_INDEX = 0          # built-in cam usually 0
 CONF_THRES = 0.35         # person conf threshold
@@ -27,6 +40,29 @@ TIME_WINDOW = 7.0         # seconds to pair entry + "hello"
 MIN_PERSIST_NEW = 3       # frames of person presence before counting as "entry"
 ASR_SAMPLE_RATE = 16000   # Vosk model default
 HELLO_WORDS = {"hello", "hi", "hey"}  # accept any of these
+FACE_MATCH_THRESHOLD = 0.45
+
+REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
+VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
+
+KOANS = [
+    "What is the sound of one hand clapping?",
+    "If you meet the Buddha on the road, kill him.",
+    "The instant you speak about a thing, you miss the mark.",
+    "When you can do nothing, what can you do?",
+    "Where can you go to escape your own footprints?",
+    "Not knowing is most intimate.",
+    "Who is it that now hears this sound?",
+    "What was your original face before your parents were born?",
+    "A single instant is eternity; eternity is the now.",
+    "When the many are reduced to one, to what is the one reduced?",
+]
+
+
+registry_lock = threading.Lock()
+known_names: list[str] = []
+known_encodings: list[np.ndarray] = []
+enrollment_requests: "queue.Queue[np.ndarray]" = queue.Queue()
 # ----------------------------
 
 def load_asr_model():
@@ -83,12 +119,147 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event):
         while not stop_ev.is_set():
             sd.sleep(100)
 
+
+def ensure_registry_loaded():
+    """Load known people from disk once at startup."""
+    global known_names, known_encodings
+    with registry_lock:
+        if known_names:
+            return
+        if REGISTRY_PATH.exists():
+            try:
+                data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                print("[red]Failed to read known people registry; starting fresh.[/red]")
+                data = []
+        else:
+            data = []
+        loaded_names: list[str] = []
+        loaded_encodings: list[np.ndarray] = []
+        for entry in data:
+            name = entry.get("name")
+            encoding = entry.get("encoding")
+            if not name or not encoding:
+                continue
+            loaded_names.append(name)
+            loaded_encodings.append(np.array(encoding, dtype="float32"))
+        known_names = loaded_names
+        known_encodings = loaded_encodings
+        if known_names:
+            print(f"[green]Loaded {len(known_names)} known visitor(s).[/green]")
+
+
+def persist_registry_locked():
+    """Persist the known people registry to disk. Caller must hold registry_lock."""
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = [
+        {"name": name, "encoding": encoding.tolist()}
+        for name, encoding in zip(known_names, known_encodings)
+    ]
+    REGISTRY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def log_presence(name: str):
+    """Append a presence entry to the visitor log."""
+    VISITOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(VISITOR_LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"{timestamp} - {name}\n")
+
+
+def share_koan(name: str):
+    koan = random.choice(KOANS)
+    print(f"[italic blue]A koan for {name}: {koan}[/italic blue]")
+
+
+def add_known_person(name: str, encoding: np.ndarray):
+    encoding = np.asarray(encoding, dtype="float32")
+    with registry_lock:
+        known_names.append(name)
+        known_encodings.append(encoding)
+        persist_registry_locked()
+    print(f"[bold green]Greetings, {name}! Your presence has been logged.[/bold green]")
+    log_presence(name)
+    share_koan(name)
+
+
+def greet_known_person(name: str):
+    print(f"[bold cyan]Welcome back, {name}! Your presence has been logged.[/bold cyan]")
+    log_presence(name)
+    share_koan(name)
+
+
+def analyze_faces(frame: np.ndarray):
+    rgb_frame = frame[:, :, ::-1]
+    locations = face_recognition.face_locations(rgb_frame)
+    if not locations:
+        return []
+    encodings = face_recognition.face_encodings(rgb_frame, locations)
+    analyses = []
+    with registry_lock:
+        stored_encodings = list(known_encodings)
+        stored_names = list(known_names)
+    for location, encoding in zip(locations, encodings):
+        match_name = None
+        if stored_encodings:
+            distances = face_recognition.face_distance(stored_encodings, encoding)
+            best_idx = int(np.argmin(distances))
+            if distances[best_idx] <= FACE_MATCH_THRESHOLD:
+                match_name = stored_names[best_idx]
+        analyses.append({
+            "location": location,
+            "encoding": encoding,
+            "name": match_name,
+        })
+    return analyses
+
+
+def enrollment_worker(stop_ev: threading.Event):
+    while not stop_ev.is_set():
+        try:
+            encoding = enrollment_requests.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if encoding is None:
+            enrollment_requests.task_done()
+            break
+        print("[yellow]Unknown visitor detected. Please enter the name they wish to be known by (blank to skip):[/yellow]")
+        try:
+            name = input("Visitor name> ").strip()
+        except EOFError:
+            name = ""
+        if name:
+            add_known_person(name, encoding)
+        else:
+            print("[red]No name provided. Visitor was not recorded.[/red]")
+        enrollment_requests.task_done()
+
+
+def handle_entry(frame: np.ndarray):
+    faces = analyze_faces(frame)
+    if not faces:
+        print("[red]Entry detected but no clear face found.[/red]")
+        return
+    for face in faces:
+        name = face["name"]
+        encoding = face["encoding"]
+        if name:
+            greet_known_person(name)
+        else:
+            print("[bold yellow]Hello there! Please let us know who you are.[/bold yellow]")
+            enrollment_requests.put(encoding)
+
+
 def main():
     # Prepare event channels
     asr_events = queue.Queue()
     stop_ev = threading.Event()
     t_asr = threading.Thread(target=asr_listener, args=(asr_events, stop_ev), daemon=True)
     t_asr.start()
+
+    ensure_registry_loaded()
+    t_enroll = threading.Thread(target=enrollment_worker, args=(stop_ev,), daemon=True)
+    t_enroll.start()
 
     # Load YOLOv8n (auto-download on first use)
     model = YOLO("yolov8n.pt")
@@ -172,6 +343,7 @@ def main():
                 ts = time.time()
                 entries.append(ts)
                 print(f"[magenta]Entry detected @ {time.strftime('%H:%M:%S')}[/magenta]")
+                handle_entry(frame.copy())
 
             prev_person_present = person_present
 
@@ -185,6 +357,8 @@ def main():
 
     finally:
         stop_ev.set()
+        enrollment_requests.put(None)
+        t_enroll.join(timeout=2.0)
         cap.release()
         cv2.destroyAllWindows()
 

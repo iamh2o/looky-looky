@@ -2,7 +2,7 @@
 /usr/bin/xcode-select --install || true
 
 # 1) Create project + venv
-mkdir door_hello && cd door_hello
+
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip

@@ -1,0 +1,4 @@
+sudo tcpdump -ni any -G 300 -w "/tmp/lan_%H%M.pcap" -W 10 'ip and (not broadcast and not multicast)'
+
+
+# then tshark -r file.pcap -q -z conv,ip

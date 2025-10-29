@@ -302,13 +302,13 @@ def add_known_person(name: str, encoding: np.ndarray):
         known_names.append(name)
         known_encodings.append(encoding)
         persist_registry_locked()
-    print(f"[bold green]Greetings, {name}! Your presence has been logged.[/bold green]")
+    print(f"[bold green]Hello {name}! You have been recorded.[/bold green]")
     log_presence(name)
     share_koan(name)
 
 
 def greet_known_person(name: str):
-    print(f"[bold cyan]Welcome back, {name}! Your presence has been logged.[/bold cyan]")
+    print(f"[bold cyan]Hello {name}! You have been recorded.[/bold cyan]")
     log_presence(name)
     share_koan(name)
 

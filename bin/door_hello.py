@@ -33,7 +33,10 @@ except ImportError as exc:
     ) from exc
 
 # ---------- Config ----------
+# Device defaults (will be configured at runtime)
 CAMERA_INDEX = 0          # built-in cam usually 0
+MIC_DEVICE_INDEX: int | None = None
+SPEAKER_DEVICE_INDEX: int | None = None
 CONF_THRES = 0.35         # person conf threshold
 FRAME_SKIP = 2            # run detector every N frames (reduce CPU)
 TIME_WINDOW = 7.0         # seconds to pair entry + "hello"
@@ -65,6 +68,124 @@ known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray]" = queue.Queue()
 # ----------------------------
 
+
+def detect_cameras(max_index: int = 10) -> list[int]:
+    """Return indexes of cameras that respond to capture attempts."""
+    found: list[int] = []
+    for idx in range(max_index):
+        cap = cv2.VideoCapture(idx)
+        if cap is not None and cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            if ret:
+                found.append(idx)
+        else:
+            if cap is not None:
+                cap.release()
+    return found
+
+
+def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Gather input/output-capable audio devices with metadata for display."""
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:  # pragma: no cover - depends on host setup
+        raise RuntimeError(f"Unable to query audio devices: {exc}") from exc
+
+    hostapis = sd.query_hostapis()
+    microphones: list[dict[str, str]] = []
+    speakers: list[dict[str, str]] = []
+
+    for idx, dev in enumerate(devices):
+        hostapi_name = ""
+        if hostapis and 0 <= dev.get("hostapi", -1) < len(hostapis):
+            hostapi_name = hostapis[dev["hostapi"]]["name"]
+        label = f"{dev['name']} ({hostapi_name})" if hostapi_name else dev["name"]
+        entry = {"index": str(idx), "label": label}
+        if dev.get("max_input_channels", 0) > 0:
+            microphones.append(entry)
+        if dev.get("max_output_channels", 0) > 0:
+            speakers.append(entry)
+    return microphones, speakers
+
+
+def prompt_choice(options: list[dict[str, str]], title: str) -> int:
+    """Ask the user to pick a device and return the chosen device index."""
+    print(f"[bold cyan]{title}[/bold cyan]")
+    for i, opt in enumerate(options, start=1):
+        print(f"  {i}. {opt['label']} (index {opt['index']})")
+
+    default_idx = 1
+    while True:
+        try:
+            raw = input(f"Select {title.lower()} [default {default_idx}]: ").strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            choice = default_idx
+        else:
+            if not raw.isdigit():
+                print("[red]Please enter a number.[/red]")
+                continue
+            choice = int(raw)
+        if 1 <= choice <= len(options):
+            selection = int(options[choice - 1]["index"])
+            print(f"[green]Selected {options[choice - 1]['label']}[/green]")
+            return selection
+        print("[red]Invalid selection. Try again.[/red]")
+
+
+def test_camera_device(index: int) -> None:
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Camera index {index} could not be opened.")
+    ret, _ = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError(f"Camera index {index} did not return frames.")
+    print("[green]Camera test passed.[/green]")
+
+
+def test_microphone_device(index: int) -> None:
+    sd.check_input_settings(device=index, samplerate=ASR_SAMPLE_RATE, channels=1)
+    with sd.InputStream(device=index, channels=1, samplerate=ASR_SAMPLE_RATE) as stream:
+        stream.read(1)
+    print("[green]Microphone test passed.[/green]")
+
+
+def test_speaker_device(index: int) -> None:
+    sd.check_output_settings(device=index, samplerate=ASR_SAMPLE_RATE, channels=1)
+    duration = 0.35
+    t = np.linspace(0, duration, int(ASR_SAMPLE_RATE * duration), False)
+    tone = 0.2 * np.sin(2 * np.pi * 880 * t)
+    sd.play(tone, samplerate=ASR_SAMPLE_RATE, device=index)
+    sd.wait()
+    print("[green]Speaker test passed (played confirmation tone).[/green]")
+
+
+def configure_io_devices() -> tuple[int, int, int]:
+    """Detect available devices, prompt user, run quick validation."""
+    cameras = detect_cameras()
+    if not cameras:
+        raise RuntimeError("No usable cameras detected. Ensure at least one camera is connected.")
+    camera_opts = [{"index": str(idx), "label": f"Camera {idx}"} for idx in cameras]
+    camera_index = prompt_choice(camera_opts, "Available Cameras")
+    test_camera_device(camera_index)
+
+    microphones, speakers = describe_audio_devices()
+    if not microphones:
+        raise RuntimeError("No microphones detected. A working microphone is required.")
+    mic_index = prompt_choice(microphones, "Available Microphones")
+    test_microphone_device(mic_index)
+
+    if not speakers:
+        raise RuntimeError("No speakers detected. A speaker/output device is required.")
+    speaker_index = prompt_choice(speakers, "Available Speakers")
+    test_speaker_device(speaker_index)
+
+    sd.default.device = (mic_index, speaker_index)
+    return camera_index, mic_index, speaker_index
+
 def load_asr_model():
     """
     Use Vosk small English model. You must download a model once.
@@ -86,7 +207,7 @@ def load_asr_model():
         "  unzip vosk-model-small-en-us-0.15.zip\n"
     )
 
-def asr_listener(event_q: queue.Queue, stop_ev: threading.Event):
+def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int | None = None):
     """
     Stream mic audio -> Vosk -> push 'hello' events with timestamps.
     """
@@ -114,7 +235,8 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event):
         blocksize=8000,
         dtype="int16",
         channels=1,
-        callback=audio_cb
+        callback=audio_cb,
+        device=mic_device,
     ):
         while not stop_ev.is_set():
             sd.sleep(100)
@@ -251,10 +373,18 @@ def handle_entry(frame: np.ndarray):
 
 
 def main():
+    global CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX
+
+    CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX = configure_io_devices()
+
     # Prepare event channels
     asr_events = queue.Queue()
     stop_ev = threading.Event()
-    t_asr = threading.Thread(target=asr_listener, args=(asr_events, stop_ev), daemon=True)
+    t_asr = threading.Thread(
+        target=asr_listener,
+        args=(asr_events, stop_ev, MIC_DEVICE_INDEX),
+        daemon=True,
+    )
     t_asr.start()
 
     ensure_registry_loaded()

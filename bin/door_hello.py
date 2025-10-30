@@ -22,6 +22,7 @@ speaker selection doesn't affect TTS. Optional fallback: set USE_OSX_SAY=1.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -55,12 +56,13 @@ CAMERA_INDEX = 0
 MIC_DEVICE_INDEX: int | None = None
 SPEAKER_DEVICE_INDEX: int | None = None
 CONF_THRES = 0.35
-FRAME_SKIP = 2
 TIME_WINDOW = 7.0
 MIN_PERSIST_NEW = 3
 ASR_SAMPLE_RATE = 16000
 HELLO_WORDS = {"hello", "hi", "hey"}
 FACE_MATCH_THRESHOLD = 0.45
+THANK_YOU_PHRASES = ("thank you zepplin", "thank you zeppelin")
+THANK_YOU_PAUSE_SECONDS = 10.0
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
 VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
@@ -167,15 +169,46 @@ def shutdown_tts() -> None:
 # -------------- end TTS --------------
 
 
-def detect_cameras(max_index: int = 10) -> list[int]:
-    found: list[int] = []
+def describe_camera(index: int) -> dict[str, str | int | None]:
+    """Best-effort camera metadata lookup for display purposes."""
+
+    name: str | None = None
+    ip: str | None = None
+
+    sysfs_name = Path(f"/sys/class/video4linux/video{index}/name")
+    if sysfs_name.exists():
+        try:
+            sysfs_value = sysfs_name.read_text(encoding="utf-8").strip()
+            if sysfs_value:
+                name = sysfs_value
+        except OSError:
+            pass
+
+    env_ip_candidates = [
+        f"CAMERA_{index}_IP",
+        f"CAMERA{index}_IP",
+        f"CAM{index}_IP",
+        f"CAMERA_{index}_ADDR",
+    ]
+    for env_name in env_ip_candidates:
+        value = os.getenv(env_name)
+        if value:
+            ip = value.strip()
+            if ip:
+                break
+
+    return {"index": index, "name": name, "ip": ip}
+
+
+def detect_cameras(max_index: int = 10) -> list[dict[str, str | int | None]]:
+    found: list[dict[str, str | int | None]] = []
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
         if cap is not None and cap.isOpened():
             ret, _ = cap.read()
             cap.release()
             if ret:
-                found.append(idx)
+                found.append(describe_camera(idx))
         else:
             if cap is not None:
                 cap.release()
@@ -262,7 +295,20 @@ def configure_io_devices() -> tuple[int, int, int]:
     cameras = detect_cameras()
     if not cameras:
         raise RuntimeError("No usable cameras detected. Ensure at least one camera is connected.")
-    camera_opts = [{"index": str(idx), "label": f"Camera {idx}"} for idx in cameras]
+    camera_opts = []
+    for cam in cameras:
+        idx = int(cam["index"])
+        details: list[str] = []
+        name = cam.get("name")
+        if name:
+            details.append(str(name))
+        ip = cam.get("ip")
+        if ip:
+            details.append(f"IP: {ip}")
+        label = f"Camera {idx}"
+        if details:
+            label = f"{label} — {', '.join(details)}"
+        camera_opts.append({"index": str(idx), "label": label})
     camera_index = prompt_choice(camera_opts, "Available Cameras")
     test_camera_device(camera_index)
 
@@ -279,6 +325,17 @@ def configure_io_devices() -> tuple[int, int, int]:
 
     sd.default.device = (mic_index, speaker_index)
     return camera_index, mic_index, speaker_index
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DoorHello monitor")
+    parser.add_argument(
+        "--recheck-interval-ms",
+        type=int,
+        default=0,
+        help="Milliseconds between entry detection passes (default: every frame)",
+    )
+    return parser.parse_args()
 
 
 def load_asr_model() -> Model:
@@ -299,7 +356,10 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
     rec = KaldiRecognizer(model, ASR_SAMPLE_RATE)
     rec.SetWords(False)
 
+    last_pause_emit = 0.0
+
     def audio_cb(indata, frames, timeinfo, status):
+        nonlocal last_pause_emit
         if status:
             pass
         if stop_ev.is_set():
@@ -312,9 +372,15 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
             j = json.loads(rec.PartialResult())
             phrase = (j.get("partial") or "").strip()
         if phrase:
+            normalized = phrase.lower()
+            now_ts = time.time()
+            if any(trigger in normalized for trigger in THANK_YOU_PHRASES):
+                if now_ts - last_pause_emit > 1.0:
+                    event_q.put(("pause", now_ts))
+                    last_pause_emit = now_ts
             tokens = {tok.strip(".,!?").lower() for tok in phrase.split()}
             if tokens & HELLO_WORDS:
-                event_q.put(("hello", time.time()))
+                event_q.put(("hello", now_ts))
 
     with sd.RawInputStream(
         samplerate=ASR_SAMPLE_RATE,
@@ -374,7 +440,9 @@ def log_presence(name: str):
 
 def share_koan(name: str):
     koan = random.choice(KOANS)
-    print(f"[italic blue]A koan for {name}: {koan}[/italic blue]")
+    message = f"A koan for {name}: {koan}"
+    print(f"[italic blue]{message}[/italic blue]")
+    speak_text(message)
 
 
 def add_known_person(name: str, encoding: np.ndarray):
@@ -476,6 +544,10 @@ def handle_entry(frame: np.ndarray):
 def main():
     global CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX
 
+    args = parse_args()
+    recheck_interval_ms = max(0, args.recheck_interval_ms)
+    recheck_interval_sec = recheck_interval_ms / 1000.0
+
     CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX = configure_io_devices()
     init_tts_engine()
 
@@ -517,11 +589,14 @@ def main():
     # Presence state
     presence_streak = 0
     occupied = False
-    frame_idx = 0
+    next_recheck_time = 0.0
 
     # Event deques
     entries = deque(maxlen=32)
     hellos = deque(maxlen=32)
+
+    paused_until: float | None = None
+    pause_active = False
 
     def pair_and_report():
         now = time.time()
@@ -552,6 +627,22 @@ def main():
                     if kind == "hello":
                         hellos.append(ts)
                         print(f"[yellow]Heard hello @ {time.strftime('%H:%M:%S')}[/yellow]")
+                    elif kind == "pause":
+                        now_mono = time.monotonic()
+                        resume_at = now_mono + THANK_YOU_PAUSE_SECONDS
+                        if paused_until is None or now_mono >= paused_until:
+                            paused_until = resume_at
+                            pause_active = True
+                            print(
+                                f"[blue]Pausing new entry detection for {THANK_YOU_PAUSE_SECONDS:.0f} seconds.[/blue]"
+                            )
+                            speak_text(
+                                f"Pausing new entry detection for {int(THANK_YOU_PAUSE_SECONDS)} seconds."
+                            )
+                        else:
+                            paused_until = resume_at
+                            print("[blue]Extending detection pause.")
+                            speak_text("Keeping detection paused a little longer.")
             except queue.Empty:
                 pass
 
@@ -560,11 +651,23 @@ def main():
                 print("[red]Frame grab failed[/red]")
                 break
 
-            frame_idx += 1
-            updated_this_frame = (frame_idx % FRAME_SKIP == 0)
+            now_mono = time.monotonic()
+            if pause_active and paused_until is not None and now_mono >= paused_until:
+                pause_active = False
+                paused_until = None
+                print("[green]Resuming new entry detection.[/green]")
+                speak_text("Resuming new entry detection.")
+
+            should_update = not pause_active and (
+                recheck_interval_sec == 0.0 or now_mono >= next_recheck_time
+            )
+            if should_update and recheck_interval_sec > 0.0:
+                next_recheck_time = now_mono + recheck_interval_sec
+            elif not should_update and recheck_interval_sec > 0.0 and next_recheck_time == 0.0:
+                next_recheck_time = now_mono + recheck_interval_sec
 
             person_present = False
-            if updated_this_frame:
+            if should_update:
                 results = model.predict(source=frame, verbose=False, classes=[0], conf=CONF_THRES)
                 det = results[0]
                 person_present = (len(det.boxes) > 0)
@@ -577,7 +680,10 @@ def main():
                 cv2.putText(frame, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             # Entry logic: fire once on threshold crossing
-            if updated_this_frame:
+            if pause_active:
+                presence_streak = 0
+                occupied = False
+            elif should_update:
                 if person_present:
                     presence_streak = min(presence_streak + 1, 1_000_000)
                     if not occupied and presence_streak >= MIN_PERSIST_NEW:
@@ -598,6 +704,18 @@ def main():
             drain_tts_queue()
 
             # UI
+            if pause_active and paused_until is not None:
+                remaining = max(0.0, paused_until - now_mono)
+                overlay = f"Detection paused {remaining:0.1f}s"
+                cv2.putText(
+                    frame,
+                    overlay,
+                    (10, frame.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
             cv2.imshow("DoorHello (press q to quit)", frame)
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break

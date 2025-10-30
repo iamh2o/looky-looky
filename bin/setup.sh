@@ -8,7 +8,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 
 # 2) Dependencies
-pip install ultralytics opencv-python numpy sounddevice vosk rich
+pip install ultralytics opencv-python numpy sounddevice vosk rich face-recognition
 
 # 3) (Optional) pin exact versions for reproducibility
 pip freeze > requirements.txt

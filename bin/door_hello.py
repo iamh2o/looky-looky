@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import sys
 import time
 import queue
@@ -61,8 +62,10 @@ MIN_PERSIST_NEW = 3
 ASR_SAMPLE_RATE = 16000
 HELLO_WORDS = {"hello", "hi", "hey"}
 FACE_MATCH_THRESHOLD = 0.45
-THANK_YOU_PHRASES = ("thank you zepplin", "thank you zeppelin")
+THANK_YOU_PHRASES = ("thank you rosy", "thank you rosy")
 THANK_YOU_PAUSE_SECONDS = 10.0
+RESUME_PHRASES = ("resume rosy", "resume rosy")
+
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
 VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
@@ -105,6 +108,28 @@ def init_tts_engine() -> pyttsx3.Engine:
         tts_engine = engine
     return tts_engine
 
+def _mac_list_video_device_names() -> dict[int, str]:
+    """
+    Return {opencv_index: device_name} on macOS via AVFoundation.
+    Best effort mapping: OpenCV uses avfoundation device ordering.
+    """
+    names = {}
+    try:
+        if platform.system() != "Darwin":
+            return names
+        # Lazy import to avoid hard dependency if not installed
+        from AVFoundation import AVCaptureDevice
+        from AVFoundation import AVMediaTypeVideo
+        devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
+        if not devices:
+            return names
+        # OpenCV avfoundation generally enumerates as 0..N in same order.
+        for i, dev in enumerate(list(devices)):
+            label = dev.localizedName() or "Camera"
+            names[i] = str(label)
+    except Exception:
+        pass
+    return names
 
 def _speak_mac_say(text: str, blocking: bool = True) -> None:
     if not text:
@@ -169,12 +194,18 @@ def shutdown_tts() -> None:
 # -------------- end TTS --------------
 
 
+
 def describe_camera(index: int) -> dict[str, str | int | None]:
     """Best-effort camera metadata lookup for display purposes."""
-
     name: str | None = None
     ip: str | None = None
 
+    # macOS path: AVFoundation
+    mac_names = _mac_list_video_device_names()
+    if index in mac_names:
+        name = mac_names[index]
+
+    # Linux path: v4l sysfs
     sysfs_name = Path(f"/sys/class/video4linux/video{index}/name")
     if sysfs_name.exists():
         try:
@@ -184,18 +215,12 @@ def describe_camera(index: int) -> dict[str, str | int | None]:
         except OSError:
             pass
 
-    env_ip_candidates = [
-        f"CAMERA_{index}_IP",
-        f"CAMERA{index}_IP",
-        f"CAM{index}_IP",
-        f"CAMERA_{index}_ADDR",
-    ]
-    for env_name in env_ip_candidates:
-        value = os.getenv(env_name)
-        if value:
-            ip = value.strip()
-            if ip:
-                break
+    # Optional IP via env
+    for env_name in (f"CAMERA_{index}_IP", f"CAMERA{index}_IP", f"CAM{index}_IP", f"CAMERA_{index}_ADDR"):
+        v = os.getenv(env_name)
+        if v:
+            ip = v.strip()
+            break
 
     return {"index": index, "name": name, "ip": ip}
 
@@ -378,6 +403,9 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
                 if now_ts - last_pause_emit > 1.0:
                     event_q.put(("pause", now_ts))
                     last_pause_emit = now_ts
+            if any(trigger in normalized for trigger in RESUME_PHRASES):
+                event_q.put(("resume", now_ts))
+                
             tokens = {tok.strip(".,!?").lower() for tok in phrase.split()}
             if tokens & HELLO_WORDS:
                 event_q.put(("hello", now_ts))
@@ -643,6 +671,10 @@ def main():
                             paused_until = resume_at
                             print("[blue]Extending detection pause.")
                             speak_text("Keeping detection paused a little longer.")
+                    elif kind == "resume":
+                        pause_active = False
+                        paused_until = None
+                        speak_text("Resuming new entry detection.")
             except queue.Empty:
                 pass
 

@@ -8,7 +8,7 @@ Adds voice commands (always listening while scanning):
   rosy, resume     -> resume entry scanning
   rosy, exit       -> cleanly exit
   rosy, hello      -> reply with fixed phrase (also true for a lone 'hello')
-  rosy, who have you seen -> summarize seen names since this run
+  rosy, whats up -> summarize seen names since this run
 
 'hello' used ALONE is a command; 'hello' inside a longer phrase still
 counts for the entry+hello pairing logic.
@@ -513,7 +513,8 @@ def _parse_command(phrase: str) -> str | None:
 
         # who have you seen — look for who + seen (+ optional have/you)
         s = " ".join(rest)
-        if re.search(r"\bwho\b", s) and re.search(r"\bseen\b", s):
+        if (re.search(r"\bwhats?\b", s) and re.search(r"\bup\b", s)) or \
+           re.search(r"\bwhat\b\s+(is|s)\s+\bup\b", s):
             return "cmd_seen"
 
     return None
@@ -690,6 +691,64 @@ def handle_entry(frame: np.ndarray):
             speak_text("I don't know you yet. Please share your name with me.", blocking=True)
             enrollment_requests.put(encoding)
 
+
+def wait_for_voice_yes(mic_device: int | None, timeout_s: float = 7.0) -> bool | None:
+    """
+    Listen briefly for a spoken yes/no.
+    Returns True (yes), False (no), or None (no decision in time window).
+    """
+    yes_words = {"yes", "yeah", "yep", "sure", "start", "begin", "go", "affirmative"}
+    no_words  = {"no", "nope", "stop", "cancel", "negative"}
+
+    rec = KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE)
+    rec.SetWords(False)
+    stop_ev = threading.Event()
+    decided: list[bool | None] = [None]  # boxed so inner fn can set it
+
+    def _norm(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"[^\w\s]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    def audio_cb(indata, frames, timeinfo, status):
+        if tts_active.is_set():
+            return
+        if stop_ev.is_set():
+            raise sd.CallbackStop()
+        chunk = bytes(indata)
+        if rec.AcceptWaveform(chunk):
+            j = json.loads(rec.Result())
+            phrase = (j.get("text") or "").strip()
+        else:
+            j = json.loads(rec.PartialResult())
+            phrase = (j.get("partial") or "").strip()
+        if not phrase:
+            return
+        toks = set(_norm(phrase).split())
+        if toks & yes_words:
+            decided[0] = True
+            stop_ev.set(); raise sd.CallbackStop()
+        if toks & no_words:
+            decided[0] = False
+            stop_ev.set(); raise sd.CallbackStop()
+
+    deadline = time.monotonic() + timeout_s
+    try:
+        with sd.RawInputStream(
+            samplerate=ASR_SAMPLE_RATE,
+            blocksize=8000,
+            dtype="int16",
+            channels=1,
+            callback=audio_cb,
+            device=mic_device,
+        ):
+            while not stop_ev.is_set() and time.monotonic() < deadline:
+                sd.sleep(100)
+    except sd.CallbackStop:
+        pass
+    return decided[0]
+
+
 # ---------- Main ----------
 def main():
     global CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX
@@ -729,18 +788,28 @@ def main():
     # Audible self-test
     speak_text("TTS online.", blocking=True)
 
-    # Prompt
+    # Prompt (voice-first, then typed fallback)
     prompt_message = "Greetings, would you like to begin monitoring?"
     speak_text(prompt_message, blocking=True)
-    while True:
-        response = input(f"{prompt_message} [y/N]: ").strip().lower()
-        if response in {"y", "yes"}:
-            break
-        if response in {"n", "no", ""}:
-            print("[cyan]Monitoring cancelled by user.[/cyan]")
-            speak_text("Exiting monitoring mode. Goodbye.", blocking=True)
-            return
-        print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
+
+    voice_decision = wait_for_voice_yes(MIC_DEVICE_INDEX, timeout_s=7.0)
+    if voice_decision is True:
+        pass  # proceed
+    elif voice_decision is False:
+        print("[cyan]Monitoring cancelled by voice.[/cyan]")
+        speak_text("Exiting monitoring mode. Goodbye.", blocking=True)
+        return
+    else:
+        # typed fallback
+        while True:
+            response = input(f"{prompt_message} [y/N]: ").strip().lower()
+            if response in {"y", "yes"}:
+                break
+            if response in {"n", "no", ""}:
+                print("[cyan]Monitoring cancelled by user.[/cyan]")
+                speak_text("Exiting monitoring mode. Goodbye.", blocking=True)
+                return
+            print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
 
     # Recheck throttle
     recheck_interval_ms = max(0, args.recheck_interval_ms)
@@ -832,7 +901,7 @@ def main():
                         speak_text("hello, what the fuck do you want?", blocking=True)
                         # keep scanning as normal
                     elif kind == "cmd_seen":
-                        print("[blue]Voice command: who have you seen[/blue]")
+                        print("[blue]Voice command: whats up[/blue]")
                         speak_seen_summary()
             except queue.Empty:
                 pass

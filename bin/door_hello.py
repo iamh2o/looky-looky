@@ -459,6 +459,19 @@ def main():
     init_tts_engine()
     start_tts_worker()
 
+    prompt_message = "Greetings, would you like to begin monitoring?"
+    speak_text(prompt_message)
+    while True:
+        response = input(f"{prompt_message} [y/N]: ").strip().lower()
+        if response in {"y", "yes"}:
+            break
+        if response in {"n", "no", ""}:
+            print("[cyan]Monitoring cancelled by user.[/cyan]")
+            speak_text("Exiting monitoring mode. Goodbye.")
+            stop_tts_worker()
+            return
+        print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
+
     # Prepare event channels
     asr_events = queue.Queue()
     stop_ev = threading.Event()

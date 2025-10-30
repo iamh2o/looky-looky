@@ -278,7 +278,8 @@ registry_lock = threading.Lock()
 known_names: list[str] = []
 known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray | None]" = queue.Queue()
-session_seen: list[tuple[float, str]] = []     # (ts, name) since program start
+session_seen: list[tuple[float, str]] = []     # kept for other uses
+session_entries: list[tuple[float, str]] = []  # (ts, name|Unknown) every entry event
 PROGRAM_STARTED_AT = time.time()
 
 # ---------- Device discovery ----------
@@ -860,18 +861,20 @@ def main():
                     except ValueError: pass
                     return
 
-    def speak_seen_summary():
-        """Summarize names seen since this run; speak it."""
-        if not session_seen:
-            speak_text("I haven't seen anyone yet.", blocking=True)
+    def speak_entries_list():
+        """Read out every entry event with wall-clock time and name (or Unknown)."""
+        if not session_entries:
+            speak_text("No entries yet.", blocking=True)
             return
-        names = [n for _, n in session_seen]
-        counts = Counter(names)
-        parts = [f"{name} {cnt} time{'s' if cnt!=1 else ''}" for name, cnt in counts.items()]
-        # Keep the readout sane
-        if len(parts) > 8:
-            parts = parts[:8] + [f"and {len(counts)-8} more"]
-        speak_text("Since I started, I've seen " + ", ".join(parts) + ".", blocking=True)
+        # Print to console for audit
+        print("[cyan]Entries this session:[/cyan]")
+        for ts, nm in session_entries:
+            print(time.strftime("  %Y-%m-%d %H:%M:%S", time.localtime(ts)), "-", nm or "Unknown")
+        # Speak a concise but complete list (can be long; that's per your request)
+        lines = []
+        for ts, nm in session_entries:
+            lines.append(f"{time.strftime('%H:%M:%S', time.localtime(ts))} — {nm or 'Unknown'}")
+        speak_text("Entries so far: " + "; ".join(lines) + ".", blocking=True)
 
     try:
         while True:
@@ -902,7 +905,7 @@ def main():
                         # keep scanning as normal
                     elif kind == "cmd_seen":
                         print("[blue]Voice command: whats up[/blue]")
-                        speak_seen_summary()
+                        speak_entries_list()
             except queue.Empty:
                 pass
             except KeyboardInterrupt:
@@ -946,10 +949,20 @@ def main():
                         ts = time.time()
                         entries.append(ts)
                         print(f"[magenta]Entry detected @ {time.strftime('%H:%M:%S')}[/magenta]")
+                        # Record this entry for the session log (names or Unknown)
+                        try:
+                            faces_now = analyze_faces(frame.copy())
+                            names_now = [f.get("name") or "Unknown" for f in faces_now] or ["Unknown"]
+                        except Exception:
+                            names_now = ["Unknown"]
+                        for nm in names_now:
+                            session_entries.append((ts, nm))
+                        # Continue with greeting/enrollment flow
                         try:
                             handle_entry(frame.copy())
                         except Exception as e:
                             print(f"[red]handle_entry error: {e}[/red]")
+
                 else:
                     presence_streak = 0
                     occupied = False

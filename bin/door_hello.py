@@ -46,7 +46,7 @@ _tts_backend: str = "pyttsx3"          # "pyttsx3" | "nsss" | "say"
 _tts_voice_requested: str | None = None
 _mac_synth = None                      # lazy NSSpeechSynthesizer wrapper instance
 tts_active = threading.Event()        # True while TTS is speaking
-ASR_TAIL_MS = 600                     # ignore mic this long *after* TTS ends
+ASR_TAIL_MS = 1000                     # ignore mic this long *after* TTS ends
 
 def _mac_list_voices() -> list[tuple[str, str]]:
     """Return [(voice_name, voice_id), ...] for macOS."""

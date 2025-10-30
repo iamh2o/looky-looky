@@ -445,8 +445,8 @@ def parse_args() -> argparse.Namespace:
                         help="Milliseconds between entry detection passes (default: every frame)")
     parser.add_argument("--tts", choices=["auto", "say", "nsss", "pyttsx3"], default="auto",
                         help="TTS backend (mac: prefer 'nsss' or 'say').")
-    parser.add_argument("--voice", type=str, default="Amélie",
-                        help="Voice name (e.g., 'Samantha', 'Alex', 'Amélie').")
+    parser.add_argument("--voice", type=str, default="Zarvox",
+                        help="Voice name (e.g., 'Samantha', 'Zarvox', 'Amélie').")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available TTS voices and exit.")
     return parser.parse_args()
@@ -654,7 +654,101 @@ def analyze_faces(frame: np.ndarray):
         analyses.append({"location": location, "encoding": encoding, "name": match_name})
     return analyses
 
-def enrollment_worker(stop_ev: threading.Event):
+def _norm_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^\w\s-]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+_NAME_TRIGGERS = [
+    ("my name is", 3),
+    ("i am", 2),
+    ("i'm", 2),
+    ("its", 2),   # vosk often drops apostrophes
+    ("it's", 2),
+    ("call me", 2),
+    ("name", 1),
+]
+
+def _extract_name_from_phrase(phrase: str) -> str | None:
+    """
+    Heuristic: pull a short span after trigger phrases; fallback to first 1–3 tokens.
+    """
+    p = _norm_text(phrase)
+    if not p:
+        return None
+    # try trigger-based extraction
+    for trig, skip in _NAME_TRIGGERS:
+        if trig in p:
+            tail = p.split(trig, 1)[1].strip()
+            if not tail:
+                continue
+            tokens = tail.split()
+            # keep up to 3 tokens for typical names
+            cand = " ".join(tokens[:3]).strip()
+            cand = re.sub(r"^(the|a|an)\s+", "", cand)  # drop leading articles
+            cand = re.sub(r"\b(so|uh|um|and|please|thanks|thank)\b.*$", "", cand).strip()
+            cand = cand[:40]
+            if len(cand) >= 2:
+                return cand.title()
+    # fallback: if short phrase (1–3 tokens), treat entire phrase as name
+    toks = p.split()
+    if 1 <= len(toks) <= 3 and all(len(t) > 1 for t in toks):
+        cand = " ".join(toks).title()
+        return cand
+    return None
+
+def listen_for_name(mic_device: int | None, timeout_s: float = 6.0) -> str | None:
+    """
+    Temporarily open the mic and try to extract a name.
+    Returns a title-cased name or None.
+    """
+    rec = KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE)
+    rec.SetWords(False)
+    stop_ev = threading.Event()
+    heard: list[str] = []
+
+    def audio_cb(indata, frames, timeinfo, status):
+        if tts_active.is_set():
+            return
+        if stop_ev.is_set():
+            raise sd.CallbackStop()
+        chunk = bytes(indata)
+        if rec.AcceptWaveform(chunk):
+            j = json.loads(rec.Result())
+            phrase = (j.get("text") or "").strip()
+            if phrase:
+                heard.append(phrase)
+                # try early extraction
+                name = _extract_name_from_phrase(phrase)
+                if name:
+                    heard.append(f"__NAME__:{name}")
+                    stop_ev.set(); raise sd.CallbackStop()
+        else:
+            # partials ignored unless you want faster reaction
+            pass
+
+    deadline = time.monotonic() + timeout_s
+    try:
+        with sd.RawInputStream(
+            samplerate=ASR_SAMPLE_RATE, blocksize=8000, dtype="int16",
+            channels=1, callback=audio_cb, device=mic_device,
+        ):
+            while not stop_ev.is_set() and time.monotonic() < deadline:
+                sd.sleep(100)
+    except sd.CallbackStop:
+        pass
+
+    # If we early-extracted a name, return it
+    for h in heard:
+        if h.startswith("__NAME__:"):
+            return h.split(":",1)[1]
+
+    # Otherwise, combine what we heard and try once more
+    combined = " ".join([h for h in heard if not h.startswith("__NAME__:")]).strip()
+    return _extract_name_from_phrase(combined)
+
+
+def enrollment_worker(stop_ev: threading.Event, mic_device: int | None):
     while not stop_ev.is_set():
         try:
             encoding = enrollment_requests.get(timeout=0.5)
@@ -663,18 +757,24 @@ def enrollment_worker(stop_ev: threading.Event):
         if encoding is None:
             enrollment_requests.task_done()
             break
+
+        # Voice-first enrollment
         speak_text("I do not recognize you. Please tell me your name so I can remember you.", blocking=True)
-        print("[yellow]Unknown visitor detected. Please enter the name they wish to be known by (blank to skip):[/yellow]")
-        try:
-            name = input("Visitor name> ").strip()
-        except EOFError:
-            name = ""
+
+        name = listen_for_name(mic_device, timeout_s=6.0)
+        if not name:
+            # One guided retry with explicit pattern
+            speak_text("Please say: I am — and then your name.", blocking=True)
+            name = listen_for_name(mic_device, timeout_s=6.0)
+
         if name:
             add_known_person(name, encoding)
         else:
             speak_text("I didn't catch a name. I'll ask again next time.", blocking=True)
-            print("[red]No name provided. Visitor was not recorded.[/red]")
+            print("[red]No name captured by voice. Visitor was not recorded.[/red]")
+
         enrollment_requests.task_done()
+
 
 def handle_entry(frame: np.ndarray):
     speak_text("Ahoy!", blocking=True)
@@ -823,7 +923,7 @@ def main():
     t_asr.start()
 
     ensure_registry_loaded()
-    t_enroll = threading.Thread(target=enrollment_worker, args=(stop_ev,), daemon=True)
+    t_enroll = threading.Thread(target=enrollment_worker, args=(stop_ev, MIC_DEVICE_INDEX), daemon=True)
     t_enroll.start()
 
     # YOLO

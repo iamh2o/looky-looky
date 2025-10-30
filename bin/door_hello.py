@@ -24,6 +24,7 @@ import sys
 import time
 import queue
 import random
+import re
 import threading
 import subprocess
 from collections import Counter, deque
@@ -44,6 +45,8 @@ tts_queue: deque[str] = deque()
 _tts_backend: str = "pyttsx3"          # "pyttsx3" | "nsss" | "say"
 _tts_voice_requested: str | None = None
 _mac_synth = None                      # lazy NSSpeechSynthesizer wrapper instance
+tts_active = threading.Event()        # True while TTS is speaking
+ASR_TAIL_MS = 600                     # ignore mic this long *after* TTS ends
 
 def _mac_list_voices() -> list[tuple[str, str]]:
     """Return [(voice_name, voice_id), ...] for macOS."""
@@ -152,50 +155,71 @@ def speak_text(message: str, *, blocking: bool = True) -> None:
     """Speak via selected backend. Blocking by default for reliability."""
     if not message:
         return
-    if _tts_backend == "say":
-        _speak_mac_say(message, blocking=blocking, voice=_tts_voice_requested)
-        return
-    if _tts_backend == "nsss":
-        global _mac_synth
-        if _mac_synth is None:
-            _mac_synth = _MacNSSS(_tts_voice_requested)
-        _mac_synth.speak(message, blocking=blocking)
-        return
-    # pyttsx3
-    if blocking:
-        engine = init_tts_engine()
-        try:
-            engine.say(message)
-            engine.runAndWait()
-        except Exception:
-            if platform.system() == "Darwin":
-                _speak_mac_say(message, blocking=True, voice=_tts_voice_requested)
-    else:
-        tts_queue.append(message)
+    tts_active.set()
+    try:
+        if _tts_backend == "say":
+            _speak_mac_say(message, blocking=blocking, voice=_tts_voice_requested)
+            return
+        if _tts_backend == "nsss":
+            global _mac_synth
+            if _mac_synth is None:
+                _mac_synth = _MacNSSS(_tts_voice_requested)
+            _mac_synth.speak(message, blocking=blocking)
+            return
+        # pyttsx3
+        if blocking:
+            engine = init_tts_engine()
+            try:
+                engine.say(message)
+                engine.runAndWait()
+            except Exception:
+                if platform.system() == "Darwin":
+                    _speak_mac_say(message, blocking=True, voice=_tts_voice_requested)
+        else:
+            tts_queue.append(message)
+    finally:
+        # End TX: keep mic gated briefly to avoid echo tail
+        until = time.monotonic() + (ASR_TAIL_MS / 1000.0)
+        def _clear_after_tail():
+            # spin until tail expires; then clear
+            while time.monotonic() < until:
+                time.sleep(0.01)
+            tts_active.clear()
+        # Clear asynchronously so we return quickly
+        threading.Thread(target=_clear_after_tail, daemon=True).start()
 
 def drain_tts_queue() -> None:
     if not tts_queue:
         return
+    tts_active.set()
     if _tts_backend == "say":
         while tts_queue:
             _speak_mac_say(tts_queue.popleft(), blocking=True, voice=_tts_voice_requested)
-        return
-    if _tts_backend == "nsss":
+    elif _tts_backend == "nsss":
         global _mac_synth
         if _mac_synth is None:
             _mac_synth = _MacNSSS(_tts_voice_requested)
         while tts_queue:
             _mac_synth.speak(tts_queue.popleft(), blocking=True)
-        return
-    engine = init_tts_engine()
-    try:
-        while tts_queue:
-            engine.say(tts_queue.popleft())
-        engine.runAndWait()
-    except Exception:
-        if platform.system() == "Darwin":
+    else:
+        engine = init_tts_engine()
+        try:
             while tts_queue:
-                _speak_mac_say(tts_queue.popleft(), blocking=True, voice=_tts_voice_requested)
+                engine.say(tts_queue.popleft())
+            engine.runAndWait()
+        except Exception:
+            if platform.system() == "Darwin":
+                while tts_queue:
+                    _speak_mac_say(tts_queue.popleft(), blocking=True, voice=_tts_voice_requested)
+    # tail clear
+    until = time.monotonic() + (ASR_TAIL_MS / 1000.0)
+    def _clear_after_tail():
+        while time.monotonic() < until:
+            time.sleep(0.01)
+        tts_active.clear()
+    threading.Thread(target=_clear_after_tail, daemon=True).start()
+
+
 
 def shutdown_tts() -> None:
     try:
@@ -420,7 +444,7 @@ def parse_args() -> argparse.Namespace:
                         help="Milliseconds between entry detection passes (default: every frame)")
     parser.add_argument("--tts", choices=["auto", "say", "nsss", "pyttsx3"], default="auto",
                         help="TTS backend (mac: prefer 'nsss' or 'say').")
-    parser.add_argument("--voice", type=str, default=None,
+    parser.add_argument("--voice", type=str, default="Amélie",
                         help="Voice name (e.g., 'Samantha', 'Alex', 'Amélie').")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available TTS voices and exit.")
@@ -440,31 +464,69 @@ def load_asr_model() -> Model:
     )
 
 # --- Command parsing helpers ---
-def _is_command_hello(phrase: str) -> bool:
-    return phrase.strip() == "hello" or phrase.strip() == "rosy, hello" or phrase.strip() == "rosy hello"
+# --- Command parsing helpers (robust) ---
+
+_ROSY_ALIASES = {"rosy", "rosie", "rosi", "rozzy", "rosybot", "rosiebot"}
+_CMD_HELLO_WORDS  = {"hello", "hi", "hey"}
+_CMD_PAUSE_WORDS  = {"pause", "hold", "stop"}
+_CMD_RESUME_WORDS = {"resume", "continue", "unpause"}
+_CMD_EXIT_WORDS   = {"exit", "quit", "bye", "goodbye"}
+# "who have you seen" variants are messy; match keywords
+def _normalize(phrase: str) -> str:
+    # lowercase, remove punctuation to spaces, collapse whitespace
+    p = phrase.lower()
+    p = re.sub(r"[^\w\s]", " ", p)     # drop commas etc.
+    p = re.sub(r"\s+", " ", p).strip()
+    return p
 
 def _parse_command(phrase: str) -> str | None:
-    p = phrase.strip().lower()
-    if p.startswith("rosy"):
-        if "pause" in p:
-            return "cmd_pause"
-        if "resume" in p:
-            return "cmd_resume"
-        if "exit" in p or "quit" in p:
-            return "cmd_exit"
-        if "who have you seen" in p or "who've you seen" in p or "who have you seen?" in p:
-            return "cmd_seen"
-        if "hello" in p:
-            return "cmd_hello"
-    if p == "hello":
+    """
+    Returns one of: cmd_pause, cmd_resume, cmd_exit, cmd_hello, cmd_seen, or None.
+    Command priority: explicit 'rosy ...' hotword; else allow bare 'hello'.
+    """
+    p = _normalize(phrase)
+    if not p:
+        return None
+    tokens = p.split()
+    if not tokens:
+        return None
+
+    # Bare 'hello' stays a command (your requirement)
+    if len(tokens) == 1 and tokens[0] in _CMD_HELLO_WORDS:
         return "cmd_hello"
+
+    # Hotword-prefixed commands: 'rosy ...' (allow aliases)
+    if tokens[0] in _ROSY_ALIASES:
+        rest = tokens[1:]
+
+        # hello
+        if any(w in _CMD_HELLO_WORDS for w in rest):
+            return "cmd_hello"
+
+        # pause/resume/exit
+        if any(w in _CMD_PAUSE_WORDS for w in rest):
+            return "cmd_pause"
+        if any(w in _CMD_RESUME_WORDS for w in rest):
+            return "cmd_resume"
+        if any(w in _CMD_EXIT_WORDS for w in rest):
+            return "cmd_exit"
+
+        # who have you seen — look for who + seen (+ optional have/you)
+        s = " ".join(rest)
+        if re.search(r"\bwho\b", s) and re.search(r"\bseen\b", s):
+            return "cmd_seen"
+
     return None
+
+DEBUG_ASR = True  # flip to True to print everything Vosk hears
 
 def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int | None = None):
     rec = KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE)
     rec.SetWords(False)
 
     def audio_cb(indata, frames, timeinfo, status):
+        if tts_active.is_set():
+            return
         if status:
             pass
         if stop_ev.is_set():
@@ -478,18 +540,22 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
             phrase = (j.get("partial") or "").strip()
         if not phrase:
             return
-        normalized = phrase.lower().strip()
+
+        if DEBUG_ASR:
+            print(f"[dim]ASR heard:[/dim] {phrase}")
 
         # Commands have priority and should NOT feed the hello-pairer.
-        cmd = _parse_command(normalized)
+        cmd = _parse_command(phrase)
         if cmd:
             event_q.put((cmd, time.time()))
             return
 
         # Pairer hello (only if 'hello' appears within longer utterances)
-        tokens = {tok.strip(".,!?") for tok in normalized.split()}
-        if tokens & HELLO_WORDS:
+        norm = _normalize(phrase)
+        tokens = set(norm.split())
+        if tokens & _CMD_HELLO_WORDS:
             event_q.put(("pair_hello", time.time()))
+
 
     with sd.RawInputStream(
         samplerate=ASR_SAMPLE_RATE, blocksize=8000, dtype="int16", channels=1,
@@ -746,7 +812,7 @@ def main():
                     kind, ts = asr_events.get_nowait()
                     if kind == "pair_hello":
                         hellos.append(ts)
-                        print(f"[yellow]Heard hello @ {time.strftime('%H:%M:%S')}[/yellow]")
+                        print(f"[yellow]Pairer hello @ {time.strftime('%H:%M:%S')}[/yellow]")
                     elif kind == "cmd_pause":
                         pause_active = True
                         paused_until = None

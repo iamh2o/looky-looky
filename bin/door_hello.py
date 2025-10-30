@@ -23,6 +23,7 @@ from ultralytics import YOLO
 
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
+import pyttsx3
 
 try:
     import face_recognition
@@ -66,7 +67,27 @@ registry_lock = threading.Lock()
 known_names: list[str] = []
 known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray]" = queue.Queue()
+tts_engine: pyttsx3.Engine | None = None
+tts_lock = threading.Lock()
 # ----------------------------
+
+
+def init_tts_engine() -> pyttsx3.Engine:
+    global tts_engine
+    if tts_engine is None:
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 175)
+        tts_engine = engine
+    return tts_engine
+
+
+def speak_text(message: str) -> None:
+    if not message:
+        return
+    engine = init_tts_engine()
+    with tts_lock:
+        engine.say(message)
+        engine.runAndWait()
 
 
 def detect_cameras(max_index: int = 10) -> list[int]:
@@ -303,12 +324,14 @@ def add_known_person(name: str, encoding: np.ndarray):
         known_encodings.append(encoding)
         persist_registry_locked()
     print(f"[bold green]Hello {name}! You have been recorded.[/bold green]")
+    speak_text(f"Ahoy {name}! I will remember you.")
     log_presence(name)
     share_koan(name)
 
 
 def greet_known_person(name: str):
     print(f"[bold cyan]Hello {name}! You have been recorded.[/bold cyan]")
+    speak_text(f"Ahoy {name}!")
     log_presence(name)
     share_koan(name)
 
@@ -347,6 +370,7 @@ def enrollment_worker(stop_ev: threading.Event):
         if encoding is None:
             enrollment_requests.task_done()
             break
+        speak_text("I do not recognize you. Please tell me your name so I can remember you.")
         print("[yellow]Unknown visitor detected. Please enter the name they wish to be known by (blank to skip):[/yellow]")
         try:
             name = input("Visitor name> ").strip()
@@ -355,11 +379,13 @@ def enrollment_worker(stop_ev: threading.Event):
         if name:
             add_known_person(name, encoding)
         else:
+            speak_text("I didn't catch a name. I'll ask again next time.")
             print("[red]No name provided. Visitor was not recorded.[/red]")
         enrollment_requests.task_done()
 
 
 def handle_entry(frame: np.ndarray):
+    speak_text("Ahoy!")
     faces = analyze_faces(frame)
     if not faces:
         print("[red]Entry detected but no clear face found.[/red]")
@@ -371,6 +397,7 @@ def handle_entry(frame: np.ndarray):
             greet_known_person(name)
         else:
             print("[bold yellow]Hello there! Please let us know who you are.[/bold yellow]")
+            speak_text("I don't know you yet. Please share your name with me.")
             enrollment_requests.put(encoding)
 
 
@@ -378,6 +405,7 @@ def main():
     global CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX
 
     CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX = configure_io_devices()
+    init_tts_engine()
 
     # Prepare event channels
     asr_events = queue.Queue()

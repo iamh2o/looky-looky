@@ -69,6 +69,9 @@ known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray]" = queue.Queue()
 tts_engine: pyttsx3.Engine | None = None
 tts_lock = threading.Lock()
+tts_queue: "queue.Queue[tuple[str | None, threading.Event | None]]" = queue.Queue()
+tts_worker: threading.Thread | None = None
+tts_stop_event: threading.Event | None = None
 # ----------------------------
 
 
@@ -81,13 +84,61 @@ def init_tts_engine() -> pyttsx3.Engine:
     return tts_engine
 
 
+def _tts_worker_loop(stop_event: threading.Event) -> None:
+    engine = init_tts_engine()
+    while not stop_event.is_set():
+        try:
+            message, done_evt = tts_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if message is None:
+            if done_evt is not None:
+                done_evt.set()
+            tts_queue.task_done()
+            break
+
+        with tts_lock:
+            engine.say(message)
+            engine.runAndWait()
+
+        if done_evt is not None:
+            done_evt.set()
+        tts_queue.task_done()
+
+
+def start_tts_worker() -> None:
+    global tts_worker, tts_stop_event
+    if tts_worker is not None and tts_worker.is_alive():
+        return
+    stop_event = threading.Event()
+    worker = threading.Thread(target=_tts_worker_loop, args=(stop_event,), daemon=True)
+    tts_stop_event = stop_event
+    tts_worker = worker
+    worker.start()
+
+
+def stop_tts_worker() -> None:
+    global tts_worker, tts_stop_event
+    if tts_worker is None:
+        return
+    done_evt = threading.Event()
+    tts_queue.put((None, done_evt))
+    done_evt.wait(timeout=2.0)
+    if tts_stop_event is not None:
+        tts_stop_event.set()
+    tts_worker.join(timeout=2.0)
+    tts_worker = None
+    tts_stop_event = None
+
+
 def speak_text(message: str) -> None:
     if not message:
         return
-    engine = init_tts_engine()
-    with tts_lock:
-        engine.say(message)
-        engine.runAndWait()
+    start_tts_worker()
+    done_evt = threading.Event()
+    tts_queue.put((message, done_evt))
+    done_evt.wait()
 
 
 def detect_cameras(max_index: int = 10) -> list[int]:
@@ -406,6 +457,7 @@ def main():
 
     CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX = configure_io_devices()
     init_tts_engine()
+    start_tts_worker()
 
     # Prepare event channels
     asr_events = queue.Queue()
@@ -521,6 +573,7 @@ def main():
         t_enroll.join(timeout=2.0)
         cap.release()
         cv2.destroyAllWindows()
+        stop_tts_worker()
 
 if __name__ == "__main__":
     main()

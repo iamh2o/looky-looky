@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
 DoorHello — camera+mic monitor with on-device person detect (YOLOv8n),
-keyword ASR ("hello" via Vosk), face recognition, and speech (pyttsx3).
+keyword ASR ("hello" via Vosk), face recognition, and robust TTS.
 
-Fixes:
-  • Face rec: use cv2.cvtColor for RGB (contiguous) to avoid dlib TypeError.
-  • Guard face-recognition errors so they can't crash the loop.
-  • TTS on main thread; clean engine shutdown to avoid AUHAL -50 noise.
-  • Entry trigger fires once when presence streak crosses threshold.
-
-Deps: ultralytics, opencv-python, numpy, rich, sounddevice, vosk, pyttsx3,
-      face_recognition (with dlib).
-
-Vosk model: unzip one of these into current dir:
-    vosk-model-small-en-us-0.15
-    vosk-model-en-us-0.22
-
-macOS: pyttsx3 uses the **system default** output device; your sounddevice
-speaker selection doesn't affect TTS. Optional fallback: set USE_OSX_SAY=1.
+Highlights:
+  • macOS-native NSSpeechSynthesizer backend with --voice (reliable).
+  • Optional /usr/bin/say backend. pyttsx3 supported but not default on macOS.
+  • Camera list shows name + IP when available.
+  • 'thank you rosy' pauses detection; 'resume rosy' resumes.
+  • --recheck-interval-ms throttles YOLO checks.
+  • Koan is spoken on greet/enroll.
 """
 
 from __future__ import annotations
@@ -44,6 +36,161 @@ import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 import pyttsx3
 
+# ---------- TTS Globals / Backends ----------
+tts_engine: pyttsx3.Engine | None = None
+tts_queue: deque[str] = deque()
+_tts_backend: str = "pyttsx3"          # one of: "pyttsx3", "nsss", "say"
+_tts_voice_requested: str | None = None
+_mac_synth = None                      # lazy NSSpeechSynthesizer wrapper instance
+
+def _mac_list_voices() -> list[tuple[str, str]]:
+    """Return [(voice_name, voice_id), ...] for macOS."""
+    try:
+        import AppKit
+        voices = []
+        for vid in AppKit.NSSpeechSynthesizer.availableVoices():
+            attrs = AppKit.NSSpeechSynthesizer.attributesForVoice_(vid) or {}
+            name = attrs.get("VoiceName", vid)
+            voices.append((str(name), str(vid)))
+        return voices
+    except Exception:
+        return []
+
+class _MacNSSS:
+    """Minimal macOS NSSpeechSynthesizer wrapper with blocking speak."""
+    def __init__(self, voice_name: str | None = None):
+        import AppKit, Foundation
+        self.AppKit = AppKit
+        self.Foundation = Foundation
+        chosen = None
+        if voice_name:
+            vlow = voice_name.lower()
+            for nm, vid in _mac_list_voices():
+                if nm.lower() == vlow or vlow in nm.lower():
+                    chosen = vid
+                    break
+        self.synth = AppKit.NSSpeechSynthesizer.alloc().initWithVoice_(chosen) if chosen \
+                     else AppKit.NSSpeechSynthesizer.alloc().init()
+        if not self.synth:
+            raise RuntimeError("Failed to init NSSpeechSynthesizer")
+
+    def speak(self, text: str, blocking: bool = True):
+        if not text:
+            return
+        self.synth.startSpeakingString_(text)
+        if not blocking:
+            return
+        rl = self.Foundation.NSRunLoop.currentRunLoop()
+        # pump runloop until done
+        while self.synth.isSpeaking():
+            rl.runUntilDate_(self.Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.05))
+
+    def stop(self):
+        try:
+            self.synth.stopSpeaking()
+        except Exception:
+            pass
+
+def _speak_mac_say(text: str, blocking: bool = True, voice: str | None = None):
+    if not text:
+        return
+    cmd = ["/usr/bin/say"]
+    if voice:
+        cmd += ["-v", voice]
+    cmd += [text]
+    if blocking:
+        subprocess.run(cmd, check=False)
+    else:
+        subprocess.Popen(cmd)
+
+def init_tts_engine() -> pyttsx3.Engine:
+    """Initialize pyttsx3 and honor --voice if possible."""
+    global tts_engine
+    if tts_engine is None:
+        engine = pyttsx3.init()
+        try:
+            engine.setProperty("rate", 175)
+            engine.setProperty("volume", 1.0)
+            if _tts_voice_requested:
+                def _pick(vname):
+                    for v in engine.getProperty("voices") or []:
+                        if v.name.lower() == vname.lower() or vname.lower() in v.name.lower():
+                            return v.id
+                    return None
+                vid = _pick(_tts_voice_requested)
+                if vid:
+                    engine.setProperty("voice", vid)
+        except Exception:
+            pass
+        tts_engine = engine
+    return tts_engine
+
+def speak_text(message: str, *, blocking: bool = True) -> None:
+    """Speak via selected backend. Blocking by default for reliability."""
+    if not message:
+        return
+    if _tts_backend == "say":
+        _speak_mac_say(message, blocking=blocking, voice=_tts_voice_requested)
+        return
+    if _tts_backend == "nsss":
+        global _mac_synth
+        if _mac_synth is None:
+            _mac_synth = _MacNSSS(_tts_voice_requested)
+        _mac_synth.speak(message, blocking=blocking)
+        return
+    # pyttsx3
+    if blocking:
+        engine = init_tts_engine()
+        try:
+            engine.say(message)
+            engine.runAndWait()
+        except Exception:
+            if platform.system() == "Darwin":
+                _speak_mac_say(message, blocking=True, voice=_tts_voice_requested)
+    else:
+        tts_queue.append(message)
+
+def drain_tts_queue() -> None:
+    if not tts_queue:
+        return
+    if _tts_backend == "say":
+        while tts_queue:
+            _speak_mac_say(tts_queue.popleft(), blocking=True, voice=_tts_voice_requested)
+        return
+    if _tts_backend == "nsss":
+        global _mac_synth
+        if _mac_synth is None:
+            _mac_synth = _MacNSSS(_tts_voice_requested)
+        while tts_queue:
+            _mac_synth.speak(tts_queue.popleft(), blocking=True)
+        return
+    engine = init_tts_engine()
+    try:
+        while tts_queue:
+            engine.say(tts_queue.popleft())
+        engine.runAndWait()
+    except Exception:
+        if platform.system() == "Darwin":
+            while tts_queue:
+                _speak_mac_say(tts_queue.popleft(), blocking=True, voice=_tts_voice_requested)
+
+def shutdown_tts() -> None:
+    try:
+        drain_tts_queue()
+    except Exception:
+        pass
+    try:
+        if _tts_backend == "nsss" and _mac_synth:
+            _mac_synth.stop()
+    except Exception:
+        pass
+    try:
+        if _tts_backend == "pyttsx3" and tts_engine is not None:
+            tts_engine.stop()
+    except Exception:
+        pass
+
+# ---------- Face recognition dep ----------
 try:
     import face_recognition
 except ImportError as exc:
@@ -62,10 +209,9 @@ MIN_PERSIST_NEW = 3
 ASR_SAMPLE_RATE = 16000
 HELLO_WORDS = {"hello", "hi", "hey"}
 FACE_MATCH_THRESHOLD = 0.45
-THANK_YOU_PHRASES = ("thank you rosy", "thank you rosy")
+THANK_YOU_PHRASES = ("thank you rosy",)   # deduped
 THANK_YOU_PAUSE_SECONDS = 10.0
-RESUME_PHRASES = ("resume rosy", "resume rosy")
-
+RESUME_PHRASES = ("resume rosy",)
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
 VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
@@ -83,47 +229,23 @@ KOANS = [
     "When the many are reduced to one, to what is the one reduced?",
 ]
 
-# In‑memory registry
+# In-memory registry
 registry_lock = threading.Lock()
 known_names: list[str] = []
 known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray | None]" = queue.Queue()
 
-# TTS (main-thread drained)
-tts_engine: pyttsx3.Engine | None = None
-tts_queue: deque[str] = deque()
-# ----------------------------
-
-
-# ---------------- TTS ----------------
-def init_tts_engine() -> pyttsx3.Engine:
-    global tts_engine
-    if tts_engine is None:
-        engine = pyttsx3.init()
-        try:
-            engine.setProperty("rate", 175)
-            engine.setProperty("volume", 1.0)
-        except Exception:
-            pass
-        tts_engine = engine
-    return tts_engine
-
+# ---------- Device discovery ----------
 def _mac_list_video_device_names() -> dict[int, str]:
-    """
-    Return {opencv_index: device_name} on macOS via AVFoundation.
-    Best effort mapping: OpenCV uses avfoundation device ordering.
-    """
+    """Return {opencv_index: device_name} via AVFoundation (best-effort)."""
     names = {}
     try:
         if platform.system() != "Darwin":
             return names
-        # Lazy import to avoid hard dependency if not installed
-        from AVFoundation import AVCaptureDevice
-        from AVFoundation import AVMediaTypeVideo
+        from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
         devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
         if not devices:
             return names
-        # OpenCV avfoundation generally enumerates as 0..N in same order.
         for i, dev in enumerate(list(devices)):
             label = dev.localizedName() or "Camera"
             names[i] = str(label)
@@ -131,81 +253,12 @@ def _mac_list_video_device_names() -> dict[int, str]:
         pass
     return names
 
-def _speak_mac_say(text: str, blocking: bool = True) -> None:
-    if not text:
-        return
-    cmd = ["/usr/bin/say", text]
-    try:
-        if blocking:
-            subprocess.run(cmd, check=False)
-        else:
-            subprocess.Popen(cmd)
-    except Exception:
-        pass
-
-
-def speak_text(message: str, *, blocking: bool = False) -> None:
-    if not message:
-        return
-    if sys.platform == "darwin" and os.getenv("USE_OSX_SAY") == "1":
-        _speak_mac_say(message, blocking=blocking)
-        return
-    if blocking:
-        engine = init_tts_engine()
-        try:
-            engine.say(message)
-            engine.runAndWait()
-        except Exception:
-            if sys.platform == "darwin":
-                _speak_mac_say(message, blocking=True)
-    else:
-        tts_queue.append(message)
-
-
-def drain_tts_queue() -> None:
-    if not tts_queue:
-        return
-    if sys.platform == "darwin" and os.getenv("USE_OSX_SAY") == "1":
-        while tts_queue:
-            _speak_mac_say(tts_queue.popleft(), blocking=True)
-        return
-    engine = init_tts_engine()
-    try:
-        while tts_queue:
-            engine.say(tts_queue.popleft())
-        engine.runAndWait()
-    except Exception:
-        if sys.platform == "darwin":
-            while tts_queue:
-                _speak_mac_say(tts_queue.popleft(), blocking=True)
-
-
-def shutdown_tts() -> None:
-    """Best-effort cleanup to avoid AUHAL errors at interpreter shutdown."""
-    try:
-        drain_tts_queue()
-    except Exception:
-        pass
-    try:
-        if tts_engine is not None:
-            tts_engine.stop()
-    except Exception:
-        pass
-# -------------- end TTS --------------
-
-
-
 def describe_camera(index: int) -> dict[str, str | int | None]:
-    """Best-effort camera metadata lookup for display purposes."""
     name: str | None = None
     ip: str | None = None
-
-    # macOS path: AVFoundation
     mac_names = _mac_list_video_device_names()
     if index in mac_names:
         name = mac_names[index]
-
-    # Linux path: v4l sysfs
     sysfs_name = Path(f"/sys/class/video4linux/video{index}/name")
     if sysfs_name.exists():
         try:
@@ -214,16 +267,12 @@ def describe_camera(index: int) -> dict[str, str | int | None]:
                 name = sysfs_value
         except OSError:
             pass
-
-    # Optional IP via env
     for env_name in (f"CAMERA_{index}_IP", f"CAMERA{index}_IP", f"CAM{index}_IP", f"CAMERA_{index}_ADDR"):
         v = os.getenv(env_name)
         if v:
             ip = v.strip()
             break
-
     return {"index": index, "name": name, "ip": ip}
-
 
 def detect_cameras(max_index: int = 10) -> list[dict[str, str | int | None]]:
     found: list[dict[str, str | int | None]] = []
@@ -239,17 +288,14 @@ def detect_cameras(max_index: int = 10) -> list[dict[str, str | int | None]]:
                 cap.release()
     return found
 
-
 def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     try:
         devices = sd.query_devices()
     except Exception as exc:
         raise RuntimeError(f"Unable to query audio devices: {exc}") from exc
-
     hostapis = sd.query_hostapis()
     microphones: list[dict[str, str]] = []
     speakers: list[dict[str, str]] = []
-
     for idx, dev in enumerate(devices):
         hostapi_name = ""
         if hostapis and 0 <= dev.get("hostapi", -1) < len(hostapis):
@@ -262,12 +308,10 @@ def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]
             speakers.append(entry)
     return microphones, speakers
 
-
 def prompt_choice(options: list[dict[str, str]], title: str) -> int:
     print(f"[bold cyan]{title}[/bold cyan]")
     for i, opt in enumerate(options, start=1):
         print(f"  {i}. {opt['label']} (index {opt['index']})")
-
     default_idx = 1
     while True:
         try:
@@ -287,7 +331,6 @@ def prompt_choice(options: list[dict[str, str]], title: str) -> int:
             return selection
         print("[red]Invalid selection. Try again.[/red]")
 
-
 def test_camera_device(index: int) -> None:
     cap = cv2.VideoCapture(index)
     if not cap.isOpened():
@@ -298,13 +341,11 @@ def test_camera_device(index: int) -> None:
         raise RuntimeError(f"Camera index {index} did not return frames.")
     print("[green]Camera test passed.[/green]")
 
-
 def test_microphone_device(index: int) -> None:
     sd.check_input_settings(device=index, samplerate=ASR_SAMPLE_RATE, channels=1)
     with sd.InputStream(device=index, channels=1, samplerate=ASR_SAMPLE_RATE) as stream:
         stream.read(1)
     print("[green]Microphone test passed.[/green]")
-
 
 def test_speaker_device(index: int) -> None:
     sd.check_output_settings(device=index, samplerate=ASR_SAMPLE_RATE, channels=1)
@@ -314,7 +355,6 @@ def test_speaker_device(index: int) -> None:
     sd.play(tone, samplerate=ASR_SAMPLE_RATE, device=index)
     sd.wait()
     print("[green]Speaker test passed (played confirmation tone).[/green]")
-
 
 def configure_io_devices() -> tuple[int, int, int]:
     cameras = detect_cameras()
@@ -351,18 +391,20 @@ def configure_io_devices() -> tuple[int, int, int]:
     sd.default.device = (mic_index, speaker_index)
     return camera_index, mic_index, speaker_index
 
-
+# ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DoorHello monitor")
-    parser.add_argument(
-        "--recheck-interval-ms",
-        type=int,
-        default=0,
-        help="Milliseconds between entry detection passes (default: every frame)",
-    )
+    parser.add_argument("--recheck-interval-ms", type=int, default=0,
+                        help="Milliseconds between entry detection passes (default: every frame)")
+    parser.add_argument("--tts", choices=["auto", "say", "nsss", "pyttsx3"], default="auto",
+                        help="TTS backend (mac: prefer 'nsss' or 'say').")
+    parser.add_argument("--voice", type=str, default="Amélie",
+                        help="Voice name (e.g., 'Samantha', 'Zarvox','Amélie').")
+    parser.add_argument("--list-voices", action="store_true",
+                        help="List available TTS voices and exit.")
     return parser.parse_args()
 
-
+# ---------- ASR ----------
 def load_asr_model() -> Model:
     candidates = ["vosk-model-small-en-us-0.15", "vosk-model-en-us-0.22"]
     for c in candidates:
@@ -375,12 +417,9 @@ def load_asr_model() -> Model:
         "  unzip vosk-model-small-en-us-0.15.zip\n"
     )
 
-
 def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int | None = None):
-    model = load_asr_model()
-    rec = KaldiRecognizer(model, ASR_SAMPLE_RATE)
+    rec = KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE)
     rec.SetWords(False)
-
     last_pause_emit = 0.0
 
     def audio_cb(indata, frames, timeinfo, status):
@@ -405,23 +444,18 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
                     last_pause_emit = now_ts
             if any(trigger in normalized for trigger in RESUME_PHRASES):
                 event_q.put(("resume", now_ts))
-                
             tokens = {tok.strip(".,!?").lower() for tok in phrase.split()}
             if tokens & HELLO_WORDS:
                 event_q.put(("hello", now_ts))
 
     with sd.RawInputStream(
-        samplerate=ASR_SAMPLE_RATE,
-        blocksize=8000,
-        dtype="int16",
-        channels=1,
-        callback=audio_cb,
-        device=mic_device,
+        samplerate=ASR_SAMPLE_RATE, blocksize=8000, dtype="int16", channels=1,
+        callback=audio_cb, device=mic_device,
     ):
         while not stop_ev.is_set():
             sd.sleep(100)
 
-
+# ---------- Registry / greetings ----------
 def ensure_registry_loaded():
     global known_names, known_encodings
     with registry_lock:
@@ -449,15 +483,10 @@ def ensure_registry_loaded():
         if known_names:
             print(f"[green]Loaded {len(known_names)} known visitor(s).[/green]")
 
-
 def persist_registry_locked():
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = [
-        {"name": name, "encoding": encoding.tolist()}
-        for name, encoding in zip(known_names, known_encodings)
-    ]
+    payload = [{"name": n, "encoding": e.tolist()} for n, e in zip(known_names, known_encodings)]
     REGISTRY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
 
 def log_presence(name: str):
     VISITOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -465,13 +494,11 @@ def log_presence(name: str):
     with open(VISITOR_LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(f"{timestamp} - {name}\n")
 
-
 def share_koan(name: str):
     koan = random.choice(KOANS)
     message = f"A koan for {name}: {koan}"
     print(f"[italic blue]{message}[/italic blue]")
-    speak_text(message)
-
+    speak_text(message, blocking=True)
 
 def add_known_person(name: str, encoding: np.ndarray):
     encoding = np.asarray(encoding, dtype="float32")
@@ -480,40 +507,26 @@ def add_known_person(name: str, encoding: np.ndarray):
         known_encodings.append(encoding)
         persist_registry_locked()
     print(f"[bold green]Hello {name}! You have been recorded.[/bold green]")
-    speak_text(f"Ahoy {name}! I will remember you.")
+    speak_text(f"Ahoy {name}! I will remember you.", blocking=True)
     log_presence(name)
     share_koan(name)
-
 
 def greet_known_person(name: str):
     print(f"[bold cyan]Hello {name}! You have been recorded.[/bold cyan]")
-    speak_text(f"Ahoy {name}!")
+    speak_text(f"Ahoy {name}!", blocking=True)
     log_presence(name)
     share_koan(name)
 
-
 def analyze_faces(frame: np.ndarray):
-    """
-    Return list of dicts with {location, encoding, name}.
-    Uses contiguous RGB to satisfy dlib/pybind.
-    """
     try:
-        # Ensure contiguous RGB (avoid negative-stride view from [:,:,::-1])
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Detect face locations (HOG is CPU-only, cnn requires dlib CNN model)
         locations = face_recognition.face_locations(rgb_frame, model="hog")
         if not locations:
             return []
-        # Compute encodings; explicitly pass num_jitters for stability
         encodings = face_recognition.face_encodings(rgb_frame, locations, num_jitters=1)
-    except TypeError as e:
-        # Most frequent failure is non-contiguous arrays; this path should be dead now
-        print(f"[red]face_encodings TypeError: {e}[/red]")
-        return []
     except Exception as e:
         print(f"[red]Face analysis error: {e}[/red]")
         return []
-
     analyses = []
     with registry_lock:
         stored_encodings = list(known_encodings)
@@ -528,7 +541,6 @@ def analyze_faces(frame: np.ndarray):
         analyses.append({"location": location, "encoding": encoding, "name": match_name})
     return analyses
 
-
 def enrollment_worker(stop_ev: threading.Event):
     while not stop_ev.is_set():
         try:
@@ -538,7 +550,7 @@ def enrollment_worker(stop_ev: threading.Event):
         if encoding is None:
             enrollment_requests.task_done()
             break
-        speak_text("I do not recognize you. Please tell me your name so I can remember you.")
+        speak_text("I do not recognize you. Please tell me your name so I can remember you.", blocking=True)
         print("[yellow]Unknown visitor detected. Please enter the name they wish to be known by (blank to skip):[/yellow]")
         try:
             name = input("Visitor name> ").strip()
@@ -547,13 +559,12 @@ def enrollment_worker(stop_ev: threading.Event):
         if name:
             add_known_person(name, encoding)
         else:
-            speak_text("I didn't catch a name. I'll ask again next time.")
+            speak_text("I didn't catch a name. I'll ask again next time.", blocking=True)
             print("[red]No name provided. Visitor was not recorded.[/red]")
         enrollment_requests.task_done()
 
-
 def handle_entry(frame: np.ndarray):
-    speak_text("Ahoy!")
+    speak_text("Ahoy!", blocking=True)
     faces = analyze_faces(frame)
     if not faces:
         print("[red]Entry detected but no clear face found.[/red]")
@@ -565,20 +576,49 @@ def handle_entry(frame: np.ndarray):
             greet_known_person(name)
         else:
             print("[bold yellow]Hello there! Please let us know who you are.[/bold yellow]")
-            speak_text("I don't know you yet. Please share your name with me.")
+            speak_text("I don't know you yet. Please share your name with me.", blocking=True)
             enrollment_requests.put(encoding)
 
-
+# ---------- Main ----------
 def main():
     global CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX
+    global _tts_backend, _tts_voice_requested, _mac_synth
 
     args = parse_args()
-    recheck_interval_ms = max(0, args.recheck_interval_ms)
-    recheck_interval_sec = recheck_interval_ms / 1000.0
+    _tts_voice_requested = args.voice
+    # Backend choice
+    if args.tts == "auto":
+        _tts_backend = "nsss" if platform.system() == "Darwin" else "pyttsx3"
+    else:
+        _tts_backend = args.tts
 
+    # Voice listing
+    if args.list_voices:
+        if _tts_backend in ("nsss", "say") and platform.system() == "Darwin":
+            voices = _mac_list_voices()
+            print("[bold cyan]macOS voices[/bold cyan]")
+            for nm, vid in voices:
+                print(f"  {nm}  —  {vid}")
+        elif _tts_backend == "pyttsx3":
+            eng = init_tts_engine()
+            print("[bold cyan]pyttsx3 voices[/bold cyan]")
+            for v in eng.getProperty("voices") or []:
+                print(f"  {v.name}  —  {v.id}")
+        else:
+            print("No voice list available on this backend/OS.")
+        return
+
+    print(f"[cyan]TTS backend:[/cyan] {_tts_backend}  [cyan]voice:[/cyan] {(_tts_voice_requested or 'default')}")
+
+    # IO device selection
     CAMERA_INDEX, MIC_DEVICE_INDEX, SPEAKER_DEVICE_INDEX = configure_io_devices()
-    init_tts_engine()
+    if _tts_backend == "pyttsx3":
+        init_tts_engine()
 
+    # Audible self-test
+    speak_text("TTS online.", blocking=True)
+
+    # Prompt
     prompt_message = "Greetings, would you like to begin monitoring?"
     speak_text(prompt_message, blocking=True)
     while True:
@@ -591,21 +631,21 @@ def main():
             return
         print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
 
-    # Event channels
+    # Recheck throttle
+    recheck_interval_ms = max(0, args.recheck_interval_ms)
+    recheck_interval_sec = recheck_interval_ms / 1000.0
+
+    # Threads
     asr_events = queue.Queue()
     stop_ev = threading.Event()
-    t_asr = threading.Thread(
-        target=asr_listener,
-        args=(asr_events, stop_ev, MIC_DEVICE_INDEX),
-        daemon=True,
-    )
+    t_asr = threading.Thread(target=asr_listener, args=(asr_events, stop_ev, MIC_DEVICE_INDEX), daemon=True)
     t_asr.start()
 
     ensure_registry_loaded()
     t_enroll = threading.Thread(target=enrollment_worker, args=(stop_ev,), daemon=True)
     t_enroll.start()
 
-    # YOLOv8n
+    # YOLO
     model = YOLO("yolov8n.pt")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -614,12 +654,10 @@ def main():
 
     print("[cyan]Camera opened. Press 'q' to quit.[/cyan]")
 
-    # Presence state
     presence_streak = 0
     occupied = False
     next_recheck_time = 0.0
 
-    # Event deques
     entries = deque(maxlen=32)
     hellos = deque(maxlen=32)
 
@@ -636,19 +674,15 @@ def main():
             for th in list(hellos):
                 if abs(th - te) <= TIME_WINDOW:
                     print(f"[bold green]✅ DETECTED:[/bold green] person came in & said hello (Δt={abs(th-te):.1f}s)")
-                    try:
-                        entries.remove(te)
-                    except ValueError:
-                        pass
-                    try:
-                        hellos.remove(th)
-                    except ValueError:
-                        pass
+                    try: entries.remove(te)
+                    except ValueError: pass
+                    try: hellos.remove(th)
+                    except ValueError: pass
                     return
 
     try:
         while True:
-            # Drain ASR events
+            # ASR events
             try:
                 while True:
                     kind, ts = asr_events.get_nowait()
@@ -657,24 +691,14 @@ def main():
                         print(f"[yellow]Heard hello @ {time.strftime('%H:%M:%S')}[/yellow]")
                     elif kind == "pause":
                         now_mono = time.monotonic()
-                        resume_at = now_mono + THANK_YOU_PAUSE_SECONDS
-                        if paused_until is None or now_mono >= paused_until:
-                            paused_until = resume_at
-                            pause_active = True
-                            print(
-                                f"[blue]Pausing new entry detection for {THANK_YOU_PAUSE_SECONDS:.0f} seconds.[/blue]"
-                            )
-                            speak_text(
-                                f"Pausing new entry detection for {int(THANK_YOU_PAUSE_SECONDS)} seconds."
-                            )
-                        else:
-                            paused_until = resume_at
-                            print("[blue]Extending detection pause.")
-                            speak_text("Keeping detection paused a little longer.")
+                        paused_until = now_mono + THANK_YOU_PAUSE_SECONDS
+                        pause_active = True
+                        print(f"[blue]Pausing new entry detection for {THANK_YOU_PAUSE_SECONDS:.0f} seconds.[/blue]")
+                        speak_text(f"Pausing new entry detection for {int(THANK_YOU_PAUSE_SECONDS)} seconds.", blocking=True)
                     elif kind == "resume":
                         pause_active = False
                         paused_until = None
-                        speak_text("Resuming new entry detection.")
+                        speak_text("Resuming new entry detection.", blocking=True)
             except queue.Empty:
                 pass
 
@@ -688,7 +712,7 @@ def main():
                 pause_active = False
                 paused_until = None
                 print("[green]Resuming new entry detection.[/green]")
-                speak_text("Resuming new entry detection.")
+                speak_text("Resuming new entry detection.", blocking=True)
 
             should_update = not pause_active and (
                 recheck_interval_sec == 0.0 or now_mono >= next_recheck_time
@@ -703,15 +727,13 @@ def main():
                 results = model.predict(source=frame, verbose=False, classes=[0], conf=CONF_THRES)
                 det = results[0]
                 person_present = (len(det.boxes) > 0)
-
-                # Draw boxes (debug)
                 for b in det.boxes:
                     x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 label = f"person: {len(det.boxes)}"
                 cv2.putText(frame, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # Entry logic: fire once on threshold crossing
+            # Entry logic
             if pause_active:
                 presence_streak = 0
                 occupied = False
@@ -731,23 +753,14 @@ def main():
                     presence_streak = 0
                     occupied = False
 
-            # Pairing + TTS
             pair_and_report()
             drain_tts_queue()
 
-            # UI
             if pause_active and paused_until is not None:
                 remaining = max(0.0, paused_until - now_mono)
                 overlay = f"Detection paused {remaining:0.1f}s"
-                cv2.putText(
-                    frame,
-                    overlay,
-                    (10, frame.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 255),
-                    2,
-                )
+                cv2.putText(frame, overlay, (10, frame.shape[0] - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.imshow("DoorHello (press q to quit)", frame)
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
@@ -755,24 +768,15 @@ def main():
     finally:
         stop_ev.set()
         enrollment_requests.put(None)
-        try:
-            t_enroll.join(timeout=2.0)
-        except Exception:
-            pass
-        try:
-            cap.release()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-        try:
-            sd.stop()  # be nice to PortAudio
-        except Exception:
-            pass
+        try: t_enroll.join(timeout=2.0)
+        except Exception: pass
+        try: cap.release()
+        except Exception: pass
+        try: cv2.destroyAllWindows()
+        except Exception: pass
+        try: sd.stop()
+        except Exception: pass
         shutdown_tts()
-
 
 if __name__ == "__main__":
     main()

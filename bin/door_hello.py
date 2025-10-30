@@ -3,23 +3,21 @@
 DoorHello — camera+mic monitor with on-device person detect (YOLOv8n),
 keyword ASR ("hello" via Vosk), face recognition, and speech (pyttsx3).
 
-Fixes vs your original:
-  • TTS now runs on the MAIN THREAD (macOS-safe). No background TTS worker.
-  • Entry trigger fixed: fires once when presence streak crosses threshold.
-  • Vosk JSON is parsed properly; matches whole-word tokens.
+Fixes:
+  • Face rec: use cv2.cvtColor for RGB (contiguous) to avoid dlib TypeError.
+  • Guard face-recognition errors so they can't crash the loop.
+  • TTS on main thread; clean engine shutdown to avoid AUHAL -50 noise.
+  • Entry trigger fires once when presence streak crosses threshold.
 
-Notes
-  • Dependencies: ultralytics, opencv-python, numpy, rich, sounddevice, vosk,
-    pyttsx3, face_recognition (and its native deps).
-  • Vosk model: unzip one of:
-        vosk-model-small-en-us-0.15
-        vosk-model-en-us-0.22
-    into the working directory.
-  • pyttsx3 uses the OS **default** output device (System Settings → Sound).
-    The 'speaker test' tone uses sounddevice’s chosen device; those may differ.
-  • Optional macOS fallback: set USE_OSX_SAY=1 to use /usr/bin/say.
+Deps: ultralytics, opencv-python, numpy, rich, sounddevice, vosk, pyttsx3,
+      face_recognition (with dlib).
 
-macOS: grant Camera & Microphone permissions on first run.
+Vosk model: unzip one of these into current dir:
+    vosk-model-small-en-us-0.15
+    vosk-model-en-us-0.22
+
+macOS: pyttsx3 uses the **system default** output device; your sounddevice
+speaker selection doesn't affect TTS. Optional fallback: set USE_OSX_SAY=1.
 """
 
 from __future__ import annotations
@@ -53,16 +51,15 @@ except ImportError as exc:
     ) from exc
 
 # ---------- Config ----------
-# Device defaults (will be configured at runtime)
-CAMERA_INDEX = 0          # built-in cam usually 0
+CAMERA_INDEX = 0
 MIC_DEVICE_INDEX: int | None = None
 SPEAKER_DEVICE_INDEX: int | None = None
-CONF_THRES = 0.35         # person conf threshold
-FRAME_SKIP = 2            # run detector every N frames (reduce CPU)
-TIME_WINDOW = 7.0         # seconds to pair entry + "hello"
-MIN_PERSIST_NEW = 3       # detection cycles required before counting as "entry"
-ASR_SAMPLE_RATE = 16000   # Vosk model default
-HELLO_WORDS = {"hello", "hi", "hey"}  # accept any of these
+CONF_THRES = 0.35
+FRAME_SKIP = 2
+TIME_WINDOW = 7.0
+MIN_PERSIST_NEW = 3
+ASR_SAMPLE_RATE = 16000
+HELLO_WORDS = {"hello", "hi", "hey"}
 FACE_MATCH_THRESHOLD = 0.45
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
@@ -95,7 +92,6 @@ tts_queue: deque[str] = deque()
 
 # ---------------- TTS ----------------
 def init_tts_engine() -> pyttsx3.Engine:
-    """Initialize pyttsx3 engine lazily."""
     global tts_engine
     if tts_engine is None:
         engine = pyttsx3.init()
@@ -109,7 +105,6 @@ def init_tts_engine() -> pyttsx3.Engine:
 
 
 def _speak_mac_say(text: str, blocking: bool = True) -> None:
-    """Optional macOS fallback via /usr/bin/say when USE_OSX_SAY=1."""
     if not text:
         return
     cmd = ["/usr/bin/say", text]
@@ -119,11 +114,10 @@ def _speak_mac_say(text: str, blocking: bool = True) -> None:
         else:
             subprocess.Popen(cmd)
     except Exception:
-        pass  # swallow; we'll still have printed logs
+        pass
 
 
 def speak_text(message: str, *, blocking: bool = False) -> None:
-    """Queue speech or speak immediately on main thread if blocking=True."""
     if not message:
         return
     if sys.platform == "darwin" and os.getenv("USE_OSX_SAY") == "1":
@@ -135,7 +129,6 @@ def speak_text(message: str, *, blocking: bool = False) -> None:
             engine.say(message)
             engine.runAndWait()
         except Exception:
-            # Last-chance fallback for macOS if pyttsx3 trips
             if sys.platform == "darwin":
                 _speak_mac_say(message, blocking=True)
     else:
@@ -143,11 +136,9 @@ def speak_text(message: str, *, blocking: bool = False) -> None:
 
 
 def drain_tts_queue() -> None:
-    """Run any queued speech on the main thread (macOS-safe)."""
     if not tts_queue:
         return
     if sys.platform == "darwin" and os.getenv("USE_OSX_SAY") == "1":
-        # Drain via /usr/bin/say
         while tts_queue:
             _speak_mac_say(tts_queue.popleft(), blocking=True)
         return
@@ -157,15 +148,26 @@ def drain_tts_queue() -> None:
             engine.say(tts_queue.popleft())
         engine.runAndWait()
     except Exception:
-        # If pyttsx3 fails mid-run, try macOS say for remaining messages
         if sys.platform == "darwin":
             while tts_queue:
                 _speak_mac_say(tts_queue.popleft(), blocking=True)
+
+
+def shutdown_tts() -> None:
+    """Best-effort cleanup to avoid AUHAL errors at interpreter shutdown."""
+    try:
+        drain_tts_queue()
+    except Exception:
+        pass
+    try:
+        if tts_engine is not None:
+            tts_engine.stop()
+    except Exception:
+        pass
 # -------------- end TTS --------------
 
 
 def detect_cameras(max_index: int = 10) -> list[int]:
-    """Return indexes of cameras that respond to capture attempts."""
     found: list[int] = []
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
@@ -181,10 +183,9 @@ def detect_cameras(max_index: int = 10) -> list[int]:
 
 
 def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Gather input/output-capable audio devices with metadata for display."""
     try:
         devices = sd.query_devices()
-    except Exception as exc:  # pragma: no cover - depends on host setup
+    except Exception as exc:
         raise RuntimeError(f"Unable to query audio devices: {exc}") from exc
 
     hostapis = sd.query_hostapis()
@@ -205,7 +206,6 @@ def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]
 
 
 def prompt_choice(options: list[dict[str, str]], title: str) -> int:
-    """Ask the user to pick a device and return the chosen device index."""
     print(f"[bold cyan]{title}[/bold cyan]")
     for i, opt in enumerate(options, start=1):
         print(f"  {i}. {opt['label']} (index {opt['index']})")
@@ -259,7 +259,6 @@ def test_speaker_device(index: int) -> None:
 
 
 def configure_io_devices() -> tuple[int, int, int]:
-    """Detect available devices, prompt user, run quick validation."""
     cameras = detect_cameras()
     if not cameras:
         raise RuntimeError("No usable cameras detected. Ensure at least one camera is connected.")
@@ -283,39 +282,28 @@ def configure_io_devices() -> tuple[int, int, int]:
 
 
 def load_asr_model() -> Model:
-    """
-    Use Vosk English model. You must download a model once and unzip it in CWD.
-    """
-    candidates = [
-        "vosk-model-small-en-us-0.15",
-        "vosk-model-en-us-0.22",
-    ]
+    candidates = ["vosk-model-small-en-us-0.15", "vosk-model-en-us-0.22"]
     for c in candidates:
         if os.path.isdir(c):
             print(f"[green]Using Vosk model: {c}[/green]")
             return Model(c)
     raise RuntimeError(
-        "Vosk model not found. Download and unzip one into the project directory:\n"
+        "Vosk model not found. Download and unzip into the project directory:\n"
         "  wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip\n"
         "  unzip vosk-model-small-en-us-0.15.zip\n"
     )
 
 
 def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int | None = None):
-    """
-    Stream mic audio -> Vosk -> push 'hello' events with timestamps.
-    """
     model = load_asr_model()
     rec = KaldiRecognizer(model, ASR_SAMPLE_RATE)
     rec.SetWords(False)
 
     def audio_cb(indata, frames, timeinfo, status):
         if status:
-            # Ignore occasional over/underflow messages
             pass
         if stop_ev.is_set():
             raise sd.CallbackStop()
-        # RawInputStream gives bytes-like buffer
         chunk = bytes(indata)
         if rec.AcceptWaveform(chunk):
             j = json.loads(rec.Result())
@@ -341,7 +329,6 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
 
 
 def ensure_registry_loaded():
-    """Load known people from disk once at startup."""
     global known_names, known_encodings
     with registry_lock:
         if known_names:
@@ -370,7 +357,6 @@ def ensure_registry_loaded():
 
 
 def persist_registry_locked():
-    """Persist the known people registry to disk. Caller must hold registry_lock."""
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = [
         {"name": name, "encoding": encoding.tolist()}
@@ -380,7 +366,6 @@ def persist_registry_locked():
 
 
 def log_presence(name: str):
-    """Append a presence entry to the visitor log."""
     VISITOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(VISITOR_LOG_PATH, "a", encoding="utf-8") as fh:
@@ -412,11 +397,27 @@ def greet_known_person(name: str):
 
 
 def analyze_faces(frame: np.ndarray):
-    rgb_frame = frame[:, :, ::-1]
-    locations = face_recognition.face_locations(rgb_frame)
-    if not locations:
+    """
+    Return list of dicts with {location, encoding, name}.
+    Uses contiguous RGB to satisfy dlib/pybind.
+    """
+    try:
+        # Ensure contiguous RGB (avoid negative-stride view from [:,:,::-1])
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Detect face locations (HOG is CPU-only, cnn requires dlib CNN model)
+        locations = face_recognition.face_locations(rgb_frame, model="hog")
+        if not locations:
+            return []
+        # Compute encodings; explicitly pass num_jitters for stability
+        encodings = face_recognition.face_encodings(rgb_frame, locations, num_jitters=1)
+    except TypeError as e:
+        # Most frequent failure is non-contiguous arrays; this path should be dead now
+        print(f"[red]face_encodings TypeError: {e}[/red]")
         return []
-    encodings = face_recognition.face_encodings(rgb_frame, locations)
+    except Exception as e:
+        print(f"[red]Face analysis error: {e}[/red]")
+        return []
+
     analyses = []
     with registry_lock:
         stored_encodings = list(known_encodings)
@@ -428,16 +429,11 @@ def analyze_faces(frame: np.ndarray):
             best_idx = int(np.argmin(distances))
             if distances[best_idx] <= FACE_MATCH_THRESHOLD:
                 match_name = stored_names[best_idx]
-        analyses.append({
-            "location": location,
-            "encoding": encoding,
-            "name": match_name,
-        })
+        analyses.append({"location": location, "encoding": encoding, "name": match_name})
     return analyses
 
 
 def enrollment_worker(stop_ev: threading.Event):
-    """Background enrollment dialog (reads from stdin)."""
     while not stop_ev.is_set():
         try:
             encoding = enrollment_requests.get(timeout=0.5)
@@ -495,7 +491,7 @@ def main():
             return
         print("[yellow]Please answer 'yes' or 'no'.[/yellow]")
 
-    # Prepare event channels
+    # Event channels
     asr_events = queue.Queue()
     stop_ev = threading.Event()
     t_asr = threading.Thread(
@@ -509,7 +505,7 @@ def main():
     t_enroll = threading.Thread(target=enrollment_worker, args=(stop_ev,), daemon=True)
     t_enroll.start()
 
-    # Load YOLOv8n (auto-download on first use)
+    # YOLOv8n
     model = YOLO("yolov8n.pt")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -518,29 +514,25 @@ def main():
 
     print("[cyan]Camera opened. Press 'q' to quit.[/cyan]")
 
-    # Presence state: fire once when we cross MIN_PERSIST_NEW
+    # Presence state
     presence_streak = 0
     occupied = False
     frame_idx = 0
 
-    # Deques for event times
+    # Event deques
     entries = deque(maxlen=32)
     hellos = deque(maxlen=32)
 
     def pair_and_report():
-        # Pair latest entry with any hello within TIME_WINDOW seconds
         now = time.time()
-        # purge old events
         while entries and now - entries[0] > TIME_WINDOW:
             entries.popleft()
         while hellos and now - hellos[0] > TIME_WINDOW:
             hellos.popleft()
-        # if we have both, and |t_hello - t_entry| <= TIME_WINDOW → success
         for te in list(entries):
             for th in list(hellos):
                 if abs(th - te) <= TIME_WINDOW:
-                    print(f"[bold green]✅ DETECTED:[/bold green] person came in & said hello "
-                          f"(Δt={abs(th-te):.1f}s)")
+                    print(f"[bold green]✅ DETECTED:[/bold green] person came in & said hello (Δt={abs(th-te):.1f}s)")
                     try:
                         entries.remove(te)
                     except ValueError:
@@ -553,7 +545,7 @@ def main():
 
     try:
         while True:
-            # Drain ASR events quickly
+            # Drain ASR events
             try:
                 while True:
                     kind, ts = asr_events.get_nowait()
@@ -571,7 +563,6 @@ def main():
             frame_idx += 1
             updated_this_frame = (frame_idx % FRAME_SKIP == 0)
 
-            # Run detector every FRAME_SKIP frames
             person_present = False
             if updated_this_frame:
                 results = model.predict(source=frame, verbose=False, classes=[0], conf=CONF_THRES)
@@ -585,7 +576,7 @@ def main():
                 label = f"person: {len(det.boxes)}"
                 cv2.putText(frame, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # Entry logic: fire once when we cross the persistence threshold
+            # Entry logic: fire once on threshold crossing
             if updated_this_frame:
                 if person_present:
                     presence_streak = min(presence_streak + 1, 1_000_000)
@@ -594,18 +585,19 @@ def main():
                         ts = time.time()
                         entries.append(ts)
                         print(f"[magenta]Entry detected @ {time.strftime('%H:%M:%S')}[/magenta]")
-                        handle_entry(frame.copy())
+                        try:
+                            handle_entry(frame.copy())
+                        except Exception as e:
+                            print(f"[red]handle_entry error: {e}[/red]")
                 else:
                     presence_streak = 0
                     occupied = False
 
-            # Pairing
+            # Pairing + TTS
             pair_and_report()
-
-            # Speak any queued TTS from the main thread
             drain_tts_queue()
 
-            # Show window
+            # UI
             cv2.imshow("DoorHello (press q to quit)", frame)
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
@@ -613,11 +605,23 @@ def main():
     finally:
         stop_ev.set()
         enrollment_requests.put(None)
-        t_enroll.join(timeout=2.0)
-        cap.release()
-        cv2.destroyAllWindows()
-        # best-effort drain any final messages
-        drain_tts_queue()
+        try:
+            t_enroll.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            cap.release()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        try:
+            sd.stop()  # be nice to PortAudio
+        except Exception:
+            pass
+        shutdown_tts()
 
 
 if __name__ == "__main__":

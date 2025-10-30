@@ -34,6 +34,7 @@ import threading
 import subprocess
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -67,6 +68,7 @@ FACE_MATCH_THRESHOLD = 0.45
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
 VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
+CAMERA_HINTS_PATH = Path(__file__).resolve().parent.parent / "logs" / "camera_hints.json"
 
 KOANS = [
     "What is the sound of one hand clapping?",
@@ -91,6 +93,178 @@ enrollment_requests: "queue.Queue[np.ndarray | None]" = queue.Queue()
 tts_engine: pyttsx3.Engine | None = None
 tts_queue: deque[str] = deque()
 # ----------------------------
+
+
+def _safe_read_text(path: Path) -> str:
+    """Return stripped text from *path* or an empty string when unavailable."""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _read_sysfs_key_values(path: Path) -> dict[str, str]:
+    """Parse key=value lines from a sysfs file into a dictionary."""
+    text = _safe_read_text(path)
+    data: dict[str, str] = {}
+    if not text:
+        return data
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            data[key] = value
+    return data
+
+
+def _normalize_detail(value: Any) -> str | None:
+    """Normalize various value types into user-presentable detail text."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value)
+    text = text.strip()
+    return text or None
+
+
+def load_camera_hints() -> dict[str, Any]:
+    """Load optional user-provided camera metadata from env or JSON file."""
+    hints_env = os.getenv("LOOKY_CAMERA_HINTS")
+    if hints_env:
+        try:
+            parsed = json.loads(hints_env)
+            if isinstance(parsed, dict):
+                return parsed
+            print("[yellow]Ignoring LOOKY_CAMERA_HINTS: expected JSON object.[/yellow]")
+        except json.JSONDecodeError as exc:
+            print(f"[yellow]Ignoring LOOKY_CAMERA_HINTS due to JSON error: {exc}[/yellow]")
+
+    if CAMERA_HINTS_PATH.exists():
+        try:
+            with CAMERA_HINTS_PATH.open("r", encoding="utf-8") as fh:
+                parsed = json.load(fh)
+            if isinstance(parsed, dict):
+                return parsed
+            print(
+                f"[yellow]Ignoring {CAMERA_HINTS_PATH}: expected top-level JSON object.[/yellow]"
+            )
+        except Exception as exc:  # pragma: no cover - depends on host FS
+            print(f"[yellow]Unable to read camera hints: {exc}[/yellow]")
+    return {}
+
+
+def _append_hint_detail(
+    details: list[str], seen: set[str], key: str | None, value: Any
+) -> None:
+    normalized = _normalize_detail(value)
+    if not normalized:
+        return
+    if key and isinstance(key, str):
+        label = key.strip().lower()
+        if label in {"details", "detail", "notes", "note", "extra"}:
+            text = normalized
+        else:
+            text = f"{key}: {normalized}"
+    else:
+        text = normalized
+    if text not in seen:
+        details.append(text)
+        seen.add(text)
+
+
+def build_camera_label(
+    index: int,
+    hints: dict[str, Any],
+    backend: str,
+    width: int,
+    height: int,
+    fps: float,
+) -> str:
+    """Construct a descriptive label for a camera index."""
+
+    dev_node = Path(f"/dev/video{index}")
+    sys_base = Path(f"/sys/class/video4linux/video{index}")
+    default_name = _safe_read_text(sys_base / "name") or None
+
+    details: list[str] = []
+    seen: set[str] = set()
+
+    hint_entry = hints.get(str(index)) or hints.get(str(dev_node))
+    hint_name: str | None = None
+
+    if isinstance(hint_entry, dict):
+        raw_name = hint_entry.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            hint_name = raw_name.strip()
+        for key, value in hint_entry.items():
+            if key == "name":
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    _append_hint_detail(details, seen, key, item)
+            else:
+                _append_hint_detail(details, seen, key, value)
+    elif hint_entry is not None:
+        _append_hint_detail(details, seen, None, hint_entry)
+
+    if dev_node.exists():
+        _append_hint_detail(details, seen, "path", str(dev_node))
+        try:
+            real_path = os.path.realpath(dev_node)
+        except OSError:
+            real_path = None
+        if real_path and real_path != str(dev_node):
+            _append_hint_detail(details, seen, "resolved", real_path)
+
+    uevent = _read_sysfs_key_values(sys_base / "device" / "uevent")
+    if uevent:
+        product = uevent.get("PRODUCT")
+        if product:
+            parts = product.split("/")
+            if len(parts) == 3:
+                vendor, product_id, revision = parts
+                _append_hint_detail(
+                    details,
+                    seen,
+                    None,
+                    f"product {vendor}:{product_id} (rev {revision})",
+                )
+            else:
+                _append_hint_detail(details, seen, None, f"product {product}")
+        driver = uevent.get("DRIVER")
+        if driver:
+            _append_hint_detail(details, seen, None, f"driver {driver}")
+        serial = uevent.get("SERIAL")
+        if serial:
+            _append_hint_detail(details, seen, "serial", serial)
+        slot = uevent.get("PCI_SLOT_NAME")
+        if slot:
+            _append_hint_detail(details, seen, "slot", slot)
+
+    if width > 0 and height > 0:
+        _append_hint_detail(details, seen, None, f"{width}x{height}")
+    if fps > 0:
+        _append_hint_detail(details, seen, None, f"{fps:.1f} fps")
+    if backend:
+        _append_hint_detail(details, seen, "backend", backend)
+
+    name = hint_name or default_name or f"Camera {index}"
+    if hint_name and default_name and hint_name.lower() != default_name.lower():
+        _append_hint_detail(details, seen, "hardware", default_name)
+
+    if not details:
+        return name
+    return f"{name} — {', '.join(details)}"
 
 
 # ---------------- TTS ----------------
@@ -164,20 +338,56 @@ def drain_tts_queue() -> None:
 # -------------- end TTS --------------
 
 
-def detect_cameras(max_index: int = 10) -> list[int]:
-    """Return indexes of cameras that respond to capture attempts."""
-    found: list[int] = []
+def detect_cameras(max_index: int = 10) -> list[dict[str, str]]:
+    """Return descriptive camera options for usable video capture devices."""
+
+    options: list[dict[str, str]] = []
+    hints = load_camera_hints()
+
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
-        if cap is not None and cap.isOpened():
-            ret, _ = cap.read()
+        if cap is None:
+            continue
+        if not cap.isOpened():
             cap.release()
+            continue
+
+        backend_name = ""
+        width = 0
+        height = 0
+        fps = 0.0
+        usable = False
+
+        try:
+            try:
+                ret, _ = cap.read()
+            except Exception:
+                ret = False
             if ret:
-                found.append(idx)
-        else:
-            if cap is not None:
-                cap.release()
-    return found
+                usable = True
+                get_backend = getattr(cap, "getBackendName", None)
+                if callable(get_backend):
+                    try:
+                        backend_name = str(get_backend())
+                    except Exception:
+                        backend_name = ""
+                try:
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                except Exception:
+                    width = height = 0
+                    fps = 0.0
+        finally:
+            cap.release()
+
+        if not usable:
+            continue
+
+        label = build_camera_label(idx, hints, backend_name, width, height, fps)
+        options.append({"index": str(idx), "label": label})
+
+    return options
 
 
 def describe_audio_devices() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -260,10 +470,9 @@ def test_speaker_device(index: int) -> None:
 
 def configure_io_devices() -> tuple[int, int, int]:
     """Detect available devices, prompt user, run quick validation."""
-    cameras = detect_cameras()
-    if not cameras:
+    camera_opts = detect_cameras()
+    if not camera_opts:
         raise RuntimeError("No usable cameras detected. Ensure at least one camera is connected.")
-    camera_opts = [{"index": str(idx), "label": f"Camera {idx}"} for idx in cameras]
     camera_index = prompt_choice(camera_opts, "Available Cameras")
     test_camera_device(camera_index)
 

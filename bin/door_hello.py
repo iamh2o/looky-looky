@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 DoorHello — camera+mic monitor with on-device person detect (YOLOv8n),
-keyword ASR ("hello" via Vosk), face recognition, and robust TTS.
+keyword ASR (Vosk), face recognition, and robust TTS backends.
 
-Highlights:
-  • macOS-native NSSpeechSynthesizer backend with --voice (reliable).
-  • Optional /usr/bin/say backend. pyttsx3 supported but not default on macOS.
-  • Camera list shows name + IP when available.
-  • 'thank you rosy' pauses detection; 'resume rosy' resumes.
-  • --recheck-interval-ms throttles YOLO checks.
-  • Koan is spoken on greet/enroll.
+Adds voice commands (always listening while scanning):
+  rosy, pause      -> pause entry scanning (keep listening for commands)
+  rosy, resume     -> resume entry scanning
+  rosy, exit       -> cleanly exit
+  rosy, hello      -> reply with fixed phrase (also true for a lone 'hello')
+  rosy, who have you seen -> summarize seen names since this run
+
+'hello' used ALONE is a command; 'hello' inside a longer phrase still
+counts for the entry+hello pairing logic.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import queue
 import random
 import threading
 import subprocess
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import cv2
@@ -39,7 +41,7 @@ import pyttsx3
 # ---------- TTS Globals / Backends ----------
 tts_engine: pyttsx3.Engine | None = None
 tts_queue: deque[str] = deque()
-_tts_backend: str = "pyttsx3"          # one of: "pyttsx3", "nsss", "say"
+_tts_backend: str = "pyttsx3"          # "pyttsx3" | "nsss" | "say"
 _tts_voice_requested: str | None = None
 _mac_synth = None                      # lazy NSSpeechSynthesizer wrapper instance
 
@@ -57,22 +59,44 @@ def _mac_list_voices() -> list[tuple[str, str]]:
         return []
 
 class _MacNSSS:
-    """Minimal macOS NSSpeechSynthesizer wrapper with blocking speak."""
-    def __init__(self, voice_name: str | None = None):
+    """macOS NSSpeechSynthesizer with robust voice selection + runloop pump."""
+    def __init__(self, voice_req: str | None = None):
         import AppKit, Foundation
         self.AppKit = AppKit
         self.Foundation = Foundation
-        chosen = None
-        if voice_name:
-            vlow = voice_name.lower()
-            for nm, vid in _mac_list_voices():
-                if nm.lower() == vlow or vlow in nm.lower():
-                    chosen = vid
-                    break
-        self.synth = AppKit.NSSpeechSynthesizer.alloc().initWithVoice_(chosen) if chosen \
-                     else AppKit.NSSpeechSynthesizer.alloc().init()
+        self.synth = AppKit.NSSpeechSynthesizer.alloc().init()
         if not self.synth:
             raise RuntimeError("Failed to init NSSpeechSynthesizer")
+        self._select_voice(voice_req)
+
+    def _select_voice(self, voice_req: str | None):
+        AppKit = self.AppKit
+        if not voice_req:
+            self._log_selected("default")
+            return
+        want = voice_req.strip().lower()
+        chosen_id = None
+        chosen_name = None
+        for vid in AppKit.NSSpeechSynthesizer.availableVoices():
+            attrs = AppKit.NSSpeechSynthesizer.attributesForVoice_(vid) or {}
+            nm = str(attrs.get("VoiceName", "")) or str(vid)
+            if (nm.lower() == want or want in nm.lower()
+                or str(vid).lower() == want or want in str(vid).lower()):
+                chosen_id = vid
+                chosen_name = nm
+                break
+        if chosen_id:
+            ok = self.synth.setVoice_(chosen_id)
+            self._log_selected(chosen_name if ok else "fallback-after-setVoice")
+        else:
+            self._log_selected("not-found-fallback")
+
+    def _log_selected(self, note: str):
+        AppKit = self.AppKit
+        vid = self.synth.voice()
+        attrs = AppKit.NSSpeechSynthesizer.attributesForVoice_(vid) or {}
+        nm = attrs.get("VoiceName", vid)
+        print(f"[cyan]NSSS voice:[/cyan] {nm}  [cyan]id:[/cyan] {vid}  [cyan]note:[/cyan] {note}")
 
     def speak(self, text: str, blocking: bool = True):
         if not text:
@@ -81,7 +105,6 @@ class _MacNSSS:
         if not blocking:
             return
         rl = self.Foundation.NSRunLoop.currentRunLoop()
-        # pump runloop until done
         while self.synth.isSpeaking():
             rl.runUntilDate_(self.Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.05))
 
@@ -207,11 +230,8 @@ CONF_THRES = 0.35
 TIME_WINDOW = 7.0
 MIN_PERSIST_NEW = 3
 ASR_SAMPLE_RATE = 16000
-HELLO_WORDS = {"hello", "hi", "hey"}
+HELLO_WORDS = {"hello", "hi", "hey"}          # for pairer when 'hello' not used as a command
 FACE_MATCH_THRESHOLD = 0.45
-THANK_YOU_PHRASES = ("thank you rosy",)   # deduped
-THANK_YOU_PAUSE_SECONDS = 10.0
-RESUME_PHRASES = ("resume rosy",)
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "logs" / "known_people.json"
 VISITOR_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "visitors.log"
@@ -229,11 +249,13 @@ KOANS = [
     "When the many are reduced to one, to what is the one reduced?",
 ]
 
-# In-memory registry
+# In-memory registry and session stats
 registry_lock = threading.Lock()
 known_names: list[str] = []
 known_encodings: list[np.ndarray] = []
 enrollment_requests: "queue.Queue[np.ndarray | None]" = queue.Queue()
+session_seen: list[tuple[float, str]] = []     # (ts, name) since program start
+PROGRAM_STARTED_AT = time.time()
 
 # ---------- Device discovery ----------
 def _mac_list_video_device_names() -> dict[int, str]:
@@ -398,8 +420,8 @@ def parse_args() -> argparse.Namespace:
                         help="Milliseconds between entry detection passes (default: every frame)")
     parser.add_argument("--tts", choices=["auto", "say", "nsss", "pyttsx3"], default="auto",
                         help="TTS backend (mac: prefer 'nsss' or 'say').")
-    parser.add_argument("--voice", type=str, default="Amélie",
-                        help="Voice name (e.g., 'Samantha', 'Zarvox','Amélie').")
+    parser.add_argument("--voice", type=str, default=None,
+                        help="Voice name (e.g., 'Samantha', 'Alex', 'Amélie').")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available TTS voices and exit.")
     return parser.parse_args()
@@ -417,13 +439,32 @@ def load_asr_model() -> Model:
         "  unzip vosk-model-small-en-us-0.15.zip\n"
     )
 
+# --- Command parsing helpers ---
+def _is_command_hello(phrase: str) -> bool:
+    return phrase.strip() == "hello" or phrase.strip() == "rosy, hello" or phrase.strip() == "rosy hello"
+
+def _parse_command(phrase: str) -> str | None:
+    p = phrase.strip().lower()
+    if p.startswith("rosy"):
+        if "pause" in p:
+            return "cmd_pause"
+        if "resume" in p:
+            return "cmd_resume"
+        if "exit" in p or "quit" in p:
+            return "cmd_exit"
+        if "who have you seen" in p or "who've you seen" in p or "who have you seen?" in p:
+            return "cmd_seen"
+        if "hello" in p:
+            return "cmd_hello"
+    if p == "hello":
+        return "cmd_hello"
+    return None
+
 def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int | None = None):
     rec = KaldiRecognizer(load_asr_model(), ASR_SAMPLE_RATE)
     rec.SetWords(False)
-    last_pause_emit = 0.0
 
     def audio_cb(indata, frames, timeinfo, status):
-        nonlocal last_pause_emit
         if status:
             pass
         if stop_ev.is_set():
@@ -435,18 +476,20 @@ def asr_listener(event_q: queue.Queue, stop_ev: threading.Event, mic_device: int
         else:
             j = json.loads(rec.PartialResult())
             phrase = (j.get("partial") or "").strip()
-        if phrase:
-            normalized = phrase.lower()
-            now_ts = time.time()
-            if any(trigger in normalized for trigger in THANK_YOU_PHRASES):
-                if now_ts - last_pause_emit > 1.0:
-                    event_q.put(("pause", now_ts))
-                    last_pause_emit = now_ts
-            if any(trigger in normalized for trigger in RESUME_PHRASES):
-                event_q.put(("resume", now_ts))
-            tokens = {tok.strip(".,!?").lower() for tok in phrase.split()}
-            if tokens & HELLO_WORDS:
-                event_q.put(("hello", now_ts))
+        if not phrase:
+            return
+        normalized = phrase.lower().strip()
+
+        # Commands have priority and should NOT feed the hello-pairer.
+        cmd = _parse_command(normalized)
+        if cmd:
+            event_q.put((cmd, time.time()))
+            return
+
+        # Pairer hello (only if 'hello' appears within longer utterances)
+        tokens = {tok.strip(".,!?") for tok in normalized.split()}
+        if tokens & HELLO_WORDS:
+            event_q.put(("pair_hello", time.time()))
 
     with sd.RawInputStream(
         samplerate=ASR_SAMPLE_RATE, blocksize=8000, dtype="int16", channels=1,
@@ -493,6 +536,8 @@ def log_presence(name: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(VISITOR_LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(f"{timestamp} - {name}\n")
+    # also track this session
+    session_seen.append((time.time(), name))
 
 def share_koan(name: str):
     koan = random.choice(KOANS)
@@ -680,27 +725,53 @@ def main():
                     except ValueError: pass
                     return
 
+    def speak_seen_summary():
+        """Summarize names seen since this run; speak it."""
+        if not session_seen:
+            speak_text("I haven't seen anyone yet.", blocking=True)
+            return
+        names = [n for _, n in session_seen]
+        counts = Counter(names)
+        parts = [f"{name} {cnt} time{'s' if cnt!=1 else ''}" for name, cnt in counts.items()]
+        # Keep the readout sane
+        if len(parts) > 8:
+            parts = parts[:8] + [f"and {len(counts)-8} more"]
+        speak_text("Since I started, I've seen " + ", ".join(parts) + ".", blocking=True)
+
     try:
         while True:
             # ASR events
             try:
                 while True:
                     kind, ts = asr_events.get_nowait()
-                    if kind == "hello":
+                    if kind == "pair_hello":
                         hellos.append(ts)
                         print(f"[yellow]Heard hello @ {time.strftime('%H:%M:%S')}[/yellow]")
-                    elif kind == "pause":
-                        now_mono = time.monotonic()
-                        paused_until = now_mono + THANK_YOU_PAUSE_SECONDS
+                    elif kind == "cmd_pause":
                         pause_active = True
-                        print(f"[blue]Pausing new entry detection for {THANK_YOU_PAUSE_SECONDS:.0f} seconds.[/blue]")
-                        speak_text(f"Pausing new entry detection for {int(THANK_YOU_PAUSE_SECONDS)} seconds.", blocking=True)
-                    elif kind == "resume":
+                        paused_until = None
+                        print("[blue]Voice command: pause[/blue]")
+                        speak_text("Pausing new entry detection.", blocking=True)
+                    elif kind == "cmd_resume":
                         pause_active = False
                         paused_until = None
+                        print("[blue]Voice command: resume[/blue]")
                         speak_text("Resuming new entry detection.", blocking=True)
+                    elif kind == "cmd_exit":
+                        print("[blue]Voice command: exit[/blue]")
+                        speak_text("Exiting now. Goodbye.", blocking=True)
+                        raise KeyboardInterrupt
+                    elif kind == "cmd_hello":
+                        print("[blue]Voice command: hello[/blue]")
+                        speak_text("hello, what the fuck do you want?", blocking=True)
+                        # keep scanning as normal
+                    elif kind == "cmd_seen":
+                        print("[blue]Voice command: who have you seen[/blue]")
+                        speak_seen_summary()
             except queue.Empty:
                 pass
+            except KeyboardInterrupt:
+                break
 
             ret, frame = cap.read()
             if not ret:
@@ -708,11 +779,6 @@ def main():
                 break
 
             now_mono = time.monotonic()
-            if pause_active and paused_until is not None and now_mono >= paused_until:
-                pause_active = False
-                paused_until = None
-                print("[green]Resuming new entry detection.[/green]")
-                speak_text("Resuming new entry detection.", blocking=True)
 
             should_update = not pause_active and (
                 recheck_interval_sec == 0.0 or now_mono >= next_recheck_time
@@ -756,11 +822,12 @@ def main():
             pair_and_report()
             drain_tts_queue()
 
-            if pause_active and paused_until is not None:
-                remaining = max(0.0, paused_until - now_mono)
-                overlay = f"Detection paused {remaining:0.1f}s"
+            # HUD
+            if pause_active:
+                overlay = "Detection paused"
                 cv2.putText(frame, overlay, (10, frame.shape[0] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
             cv2.imshow("DoorHello (press q to quit)", frame)
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
